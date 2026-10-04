@@ -1,0 +1,33 @@
+name: Compile LSPosed Module
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: # Allows you to run it manually
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Setup System Gradle
+      uses: gradle/actions/setup-gradle@v3
+
+    # We use global 'gradle' instead of './gradlew' because we didn't upload wrapper files
+    - name: Build APK
+      run: gradle :app:assembleDebug
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: UsageSpoofer-APK
+        path: app/build/outputs/apk/debug/*.apk
