@@ -4,21 +4,23 @@ import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
+import de.robv.android.xposed.XSharedPreferences
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
 import android.app.usage.UsageStats
 import android.app.usage.UsageEvents
 
 class UsageStatsSpoofer : IXposedHookLoadPackage {
 
+    // Initialize cross-process preferences using your module's actual package name
+    private val prefs = XSharedPreferences("com.yourname.spoofer", "spoofer_settings")
+
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
-        // The host reward app running the Adjoe SDK
-        val targetApp = "com.rayole.cashromeo2" 
-        // The app you were assigned to install and use (Change this dynamically per task)
-        val appToSpoof = "com.example.assigned.targetapp" 
+        // The host reward app executing the telemetry gathering SDK
+        val hostApp = "com.rayole.cashromeo2" 
+        
+        if (lpparam.packageName != hostApp) return
 
-        if (lpparam.packageName != targetApp) return
-
-        XposedBridge.log("[GodMode] Operational inside: $targetApp")
+        XposedBridge.log("[GodMode] Hook successfully active inside host: $hostApp")
 
         try {
             val usageStatsManagerClass = XposedHelpers.findClass(
@@ -35,6 +37,15 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 Long::class.javaPrimitiveType, // endTime
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
+                        // Force reload the preference file from disk to get the latest UI input
+                        prefs.reload()
+                        val appToSpoof = prefs.getString("target_package_to_spoof", "")
+                        
+                        if (appToSpoof.isNullOrBlank()) {
+                            XposedBridge.log("[GodMode] Warning: No target package specified in UI settings.")
+                            return
+                        }
+
                         val resultList = param.result as? List<*> ?: return
                         
                         for (statsObj in resultList) {
@@ -46,14 +57,14 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                                 val fakeDuration = 360000L
                                 
                                 XposedHelpers.setLongField(statsObj, "mTotalTimeInForeground", fakeDuration)
-                                XposedBridge.log("[GodMode] Injected fake duration for package: $pkgName")
+                                XposedBridge.log("[GodMode] Successfully spoofed stats duration for: $pkgName")
                             }
                         }
                     }
                 }
             )
 
-            // 2. Hook the Timeline Events API to prevent desync detection
+            // 2. Hook the Timeline Events API to match the spoofed duration
             XposedHelpers.findAndHookMethod(
                 usageStatsManagerClass,
                 "queryEvents",
@@ -61,36 +72,34 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 Long::class.javaPrimitiveType, // endTime
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
+                        prefs.reload()
+                        val appToSpoof = prefs.getString("target_package_to_spoof", "")
+                        if (appToSpoof.isNullOrBlank()) return
+
                         val usageEvents = param.result as? UsageEvents ?: return
-                        
-                        // Extract query boundary configuration passed as arguments
                         val beginTime = param.args[0] as Long
                         
-                        // Construct systemic synthetic events inside the wrapper class
-                        // Event 1: ACTIVITY_RESUMED (Move to Foreground)
+                        // Construct systemic synthetic timeline milestones
                         val eventForeground = UsageEvents.Event().apply {
                             XposedHelpers.setObjectField(this, "mPackage", appToSpoof)
                             XposedHelpers.setIntField(this, "mEventType", 1) // MOVE_TO_FOREGROUND
-                            XposedHelpers.setLongField(this, "mTimeStamp", beginTime + 5000) // 5s after query start
+                            XposedHelpers.setLongField(this, "mTimeStamp", beginTime + 5000)
                         }
                         
-                        // Event 2: ACTIVITY_PAUSED (Move to Background)
                         val eventBackground = UsageEvents.Event().apply {
                             XposedHelpers.setObjectField(this, "mPackage", appToSpoof)
                             XposedHelpers.setIntField(this, "mEventType", 2) // MOVE_TO_BACKGROUND
-                            XposedHelpers.setLongField(this, "mTimeStamp", beginTime + 365000) // 6m 5s later
+                            XposedHelpers.setLongField(this, "mTimeStamp", beginTime + 365000)
                         }
-
-                        // Internal implementation optimization: 
-                        // Instead of rebuilding the native structural array iterator, 
-                        // modern bypass structures frequently inject these events directly 
-                        // into the target SDK's local processing collection loops.
+                        
+                        // In an experimental structure, these event objects must be array-inserted 
+                        // into the native iterable collection inside the returned UsageEvents instance.
                     }
                 }
             )
 
         } catch (e: Exception) {
-            XposedBridge.log("[GodMode] Hooking Deployment Error: ${e.message}")
+            XposedBridge.log("[GodMode] Failed to initialize hooks: ${e.message}")
         }
     }
 }
