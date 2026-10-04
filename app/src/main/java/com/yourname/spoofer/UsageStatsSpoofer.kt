@@ -17,7 +17,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
     }
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
-        XposedBridge.log("[GodMode] 🟢 Successfully injected into: ${lpparam.packageName}")
+        XposedBridge.log("[GodMode] ðŸŸ¢ Successfully injected into: ${lpparam.packageName}")
 
         val prefs = XSharedPreferences("com.yourname.spoofer", "SpooferConfig")
         prefs.makeWorldReadable()
@@ -37,9 +37,8 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                         val end = param.args[2] as Long
                         
                         XposedBridge.log(
-                            "[GodMode] 🕵️ ${lpparam.packageName} -> queryUsageStats (Trap A)\n" +
-                            "   ├─ Interval: $interval\n" +
-                            "   ├─ Range: ${formatTime(begin)} TO ${formatTime(end)}"
+                            "[GodMode] ðŸ•µï¸ ${lpparam.packageName} -> queryUsageStats (Trap A)\n" +
+                            "   â”œâ”€ Range: ${formatTime(begin)} TO ${formatTime(end)}"
                         )
 
                         val statsList = param.result as? List<*> ?: return
@@ -56,15 +55,15 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                                 when (mode) {
                                     0 -> { 
                                         XposedHelpers.setLongField(stat, "mTotalTimeInForeground", targetTimeMs)
-                                        XposedBridge.log("[GodMode] ⚙️ SET $pkgName to ${targetTimeMs / 60000} mins")
+                                        XposedBridge.log("[GodMode] âš™ï¸ SET $pkgName to ${targetTimeMs / 60000} mins")
                                     }
                                     1 -> { 
                                         XposedHelpers.setLongField(stat, "mTotalTimeInForeground", realTimeMs + targetTimeMs)
-                                        XposedBridge.log("[GodMode] ➕ ADDED ${targetTimeMs / 60000} mins to $pkgName")
+                                        XposedBridge.log("[GodMode] âž• ADDED ${targetTimeMs / 60000} mins to $pkgName")
                                     }
                                     2 -> { 
                                         XposedHelpers.setLongField(stat, "mTotalTimeInForeground", 0L)
-                                        XposedBridge.log("[GodMode] 👻 HIDDEN (Ghosted) $pkgName in totals")
+                                        XposedBridge.log("[GodMode] ðŸ‘» HIDDEN (Ghosted) $pkgName in totals")
                                     }
                                 }
                             }
@@ -86,8 +85,8 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                         val end = param.args[1] as Long
                         
                         XposedBridge.log(
-                            "[GodMode] 🕵️ ${lpparam.packageName} -> queryEvents (Trap B)\n" +
-                            "   ├─ Range: ${formatTime(begin)} TO ${formatTime(end)}"
+                            "[GodMode] ðŸ•µï¸ ${lpparam.packageName} -> queryEvents (Trap B)\n" +
+                            "   â”œâ”€ Range: ${formatTime(begin)} TO ${formatTime(end)}"
                         )
 
                         val usageEvents = param.result ?: return
@@ -141,9 +140,9 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
 
                                         filteredEvents.add(resumeEvent)
                                         filteredEvents.add(pauseEvent)
-                                        XposedBridge.log("[GodMode] 💉 INJECTED $pkgName from ${formatTime(fakeStartTime)} to ${formatTime(fakeEndTime)}")
+                                        XposedBridge.log("[GodMode] ðŸ’‰ INJECTED $pkgName from ${formatTime(fakeStartTime)} to ${formatTime(fakeEndTime)}")
                                     } catch (e: Exception) {
-                                        XposedBridge.log("[GodMode] ❌ Injection failed: ${e.message}")
+                                        XposedBridge.log("[GodMode] âŒ Injection failed: ${e.message}")
                                     }
                                     currentInjectionAnchor = fakeEndTime + 1000L 
                                 }
@@ -156,23 +155,11 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                         if (newArrayType != null) {
                             val newEventsArray = java.lang.reflect.Array.newInstance(newArrayType, filteredEvents.size)
                             for (i in 0 until filteredEvents.size) {
-                                java.lang.reflect.Array.set(newEventsArray, i, filteredEvents[i])ilteredEvents.indices) {
-                            java.lang.reflect.Array.set(newEventsArray, i, filteredEvents[i])
+                                java.lang.reflect.Array.set(newEventsArray, i, filteredEvents[i])
+                            }
+                            XposedHelpers.setObjectField(usageEvents, "mEventsToWrite", newEventsArray)
+                            XposedHelpers.setIntField(usageEvents, "mEventCount", filteredEvents.size)
                         }
-
-                        XposedHelpers.setObjectField(usageEvents, "mEventsToWrite", newEventsArray)
-                        XposedHelpers.setIntField(usageEvents, "mEventCount", filteredEvents.size)
-                    }
-                }
-            )
-        } catch (e: Exception) {
-            XposedBridge.lce(newArrayType, filteredEvents.size)
-                        for (i in filteredEvents.indices) {
-                            java.lang.reflect.Array.set(newEventsArray, i, filteredEvents[i])
-                        }
-
-                        XposedHelpers.setObjectField(usageEvents, "mEventsToWrite", newEventsArray)
-                        XposedHelpers.setIntField(usageEvents, "mEventCount", filteredEvents.size)
                     }
                 }
             )
