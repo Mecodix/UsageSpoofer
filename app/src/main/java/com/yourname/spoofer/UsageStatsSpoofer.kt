@@ -17,7 +17,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
     }
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
-        XposedBridge.log("[GodMode] ðŸŸ¢ Successfully injected into: ${lpparam.packageName}")
+        XposedBridge.log("[GodMode] 🟢 Reality hijacked in: ${lpparam.packageName}")
 
         val prefs = XSharedPreferences("com.yourname.spoofer", "SpooferConfig")
         prefs.makeWorldReadable()
@@ -25,52 +25,8 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         try {
             // =========================================================
             // TRAP A: queryUsageStats (The Lazy Time Buckets)
+            // (Your original code here is fine for lazy trackers)
             // =========================================================
-            XposedHelpers.findAndHookMethod(
-                "android.app.usage.UsageStatsManager", lpparam.classLoader, "queryUsageStats",
-                Int::class.java, Long::class.java, Long::class.java,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        prefs.reload()
-                        val interval = param.args[0] as Int
-                        val begin = param.args[1] as Long
-                        val end = param.args[2] as Long
-                        
-                        XposedBridge.log(
-                            "[GodMode] ðŸ•µï¸ ${lpparam.packageName} -> queryUsageStats (Trap A)\n" +
-                            "   â”œâ”€ Range: ${formatTime(begin)} TO ${formatTime(end)}"
-                        )
-
-                        val statsList = param.result as? List<*> ?: return
-
-                        for (stat in statsList) {
-                            if (stat == null) continue
-                            val pkgName = XposedHelpers.getObjectField(stat, "mPackageName") as? String ?: continue
-                            
-                            if (prefs.getBoolean("${pkgName}_active", false)) {
-                                val mode = prefs.getInt("${pkgName}_mode", 0)
-                                val targetTimeMs = prefs.getLong("${pkgName}_time", 0L)
-                                val realTimeMs = XposedHelpers.getLongField(stat, "mTotalTimeInForeground") as Long
-
-                                when (mode) {
-                                    0 -> { 
-                                        XposedHelpers.setLongField(stat, "mTotalTimeInForeground", targetTimeMs)
-                                        XposedBridge.log("[GodMode] âš™ï¸ SET $pkgName to ${targetTimeMs / 60000} mins")
-                                    }
-                                    1 -> { 
-                                        XposedHelpers.setLongField(stat, "mTotalTimeInForeground", realTimeMs + targetTimeMs)
-                                        XposedBridge.log("[GodMode] âž• ADDED ${targetTimeMs / 60000} mins to $pkgName")
-                                    }
-                                    2 -> { 
-                                        XposedHelpers.setLongField(stat, "mTotalTimeInForeground", 0L)
-                                        XposedBridge.log("[GodMode] ðŸ‘» HIDDEN (Ghosted) $pkgName in totals")
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            )
 
             // =========================================================
             // TRAP B: queryEvents (The Precise Raw Timeline)
@@ -84,26 +40,41 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                         val begin = param.args[0] as Long
                         val end = param.args[1] as Long
                         
-                        XposedBridge.log(
-                            "[GodMode] ðŸ•µï¸ ${lpparam.packageName} -> queryEvents (Trap B)\n" +
-                            "   â”œâ”€ Range: ${formatTime(begin)} TO ${formatTime(end)}"
-                        )
-
                         val usageEvents = param.result ?: return
                         val eventsArray = XposedHelpers.getObjectField(usageEvents, "mEventsToWrite") as? Array<*> ?: return
                         
                         val filteredEvents = mutableListOf<Any>()
+                        val packageRealTimes = mutableMapOf<String, Long>()
+                        val packageLastResume = mutableMapOf<String, Long>()
                         
+                        // PASS 1: Analyze & Obliterate Target Events
                         for (event in eventsArray) {
                             if (event == null) continue
                             val pkgName = XposedHelpers.getObjectField(event, "mPackage") as? String ?: ""
-                            if (prefs.getBoolean("${pkgName}_active", false) && prefs.getInt("${pkgName}_mode", 0) == 2) {
+                            val type = XposedHelpers.getIntField(event, "mEventType")
+                            val timestamp = XposedHelpers.getLongField(event, "mTimeStamp")
+                            
+                            // Track real usage time in case we need it for Mode 1 (Add Time)
+                            if (type == 1) { // ACTIVITY_RESUMED
+                                packageLastResume[pkgName] = timestamp
+                            } else if ((type == 2 || type == 23) && packageLastResume.containsKey(pkgName)) { // ACTIVITY_PAUSED / STOPPED
+                                val start = packageLastResume.remove(pkgName)!!
+                                packageRealTimes[pkgName] = (packageRealTimes[pkgName] ?: 0L) + (timestamp - start)
+                            }
+
+                            // If package is active in our spoofer, strip ALL its real events from the timeline.
+                            // We will forge a better reality for it later.
+                            if (prefs.getBoolean("${pkgName}_active", false)) {
                                 continue 
                             }
+                            
                             filteredEvents.add(event)
                         }
 
-                        var currentInjectionAnchor = begin + 43200000L 
+                        // PASS 2: Inject Flawless Reality Blocks
+                        // We start injecting 1 minute after the query 'begin' to stay safely in bounds.
+                        var anchorTime = begin + 60000L 
+                        
                         val allPackagesActive = prefs.all.keys.filter { it.endsWith("_active") }
                         
                         for (key in allPackagesActive) {
@@ -112,49 +83,68 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                                 val mode = prefs.getInt("${pkgName}_mode", 0)
                                 val addedTimeMs = prefs.getLong("${pkgName}_time", 0L)
                                 
-                                if ((mode == 1 || mode == 0) && addedTimeMs > 0) {
-                                    val fakeStartTime = currentInjectionAnchor
-                                    val fakeEndTime = fakeStartTime + addedTimeMs
+                                var targetDuration = 0L
+                                when (mode) {
+                                    0 -> targetDuration = addedTimeMs // Mode 0: Exact Time
+                                    1 -> {
+                                        // Mode 1: Real Time + Added Time
+                                        val realTime = packageRealTimes[pkgName] ?: 0L
+                                        targetDuration = realTime + addedTimeMs
+                                    }
+                                    // Mode 2 (Ghost) skips this entirely, leaving 0 events. Perfect stealth.
+                                }
+                                
+                                if (targetDuration > 0) {
+                                    // Cap it so we don't accidentally project into the future and crash the tracker
+                                    val maxAllowed = end - anchorTime - 60000L
+                                    if (targetDuration > maxAllowed) targetDuration = maxAllowed
                                     
-                                    val iterator = filteredEvents.iterator()
-                                    while (iterator.hasNext()) {
-                                        val realEvent = iterator.next()
-                                        val realTimestamp = XposedHelpers.getLongField(realEvent, "mTimeStamp")
-                                        if (realTimestamp in fakeStartTime..fakeEndTime) {
-                                            iterator.remove() 
+                                    if (targetDuration > 0) {
+                                        val fakeStartTime = anchorTime
+                                        val fakeEndTime = fakeStartTime + targetDuration
+                                        
+                                        try {
+                                            val eventClass = Class.forName("android.app.usage.UsageEvents\$Event")
+                                            
+                                            // INJECT: RESUME
+                                            val resumeEvent = eventClass.newInstance()
+                                            XposedHelpers.setObjectField(resumeEvent, "mPackage", pkgName)
+                                            XposedHelpers.setObjectField(resumeEvent, "mClass", "$pkgName.MainActivity") // Mandatory for smart trackers
+                                            XposedHelpers.setIntField(resumeEvent, "mEventType", 1) 
+                                            XposedHelpers.setLongField(resumeEvent, "mTimeStamp", fakeStartTime)
+
+                                            // INJECT: PAUSE
+                                            val pauseEvent = eventClass.newInstance()
+                                            XposedHelpers.setObjectField(pauseEvent, "mPackage", pkgName)
+                                            XposedHelpers.setObjectField(pauseEvent, "mClass", "$pkgName.MainActivity")
+                                            XposedHelpers.setIntField(pauseEvent, "mEventType", 2) 
+                                            XposedHelpers.setLongField(pauseEvent, "mTimeStamp", fakeEndTime)
+
+                                            filteredEvents.add(resumeEvent)
+                                            filteredEvents.add(pauseEvent)
+                                            
+                                            XposedBridge.log("[GodMode] 💉 INJECTED TIMELINE: $pkgName from ${formatTime(fakeStartTime)} to ${formatTime(fakeEndTime)} (${targetDuration / 60000} mins)")
+                                            
+                                            // Shift anchor forward so the next spoofed app doesn't overlap! 
+                                            // Android only allows one foreground app at a time.
+                                            anchorTime = fakeEndTime + 1000L 
+                                        } catch (e: Exception) {
+                                            XposedBridge.log("[GodMode] ❌ Injection failed: ${e.message}")
                                         }
                                     }
-
-                                    try {
-                                        val eventClass = Class.forName("android.app.usage.UsageEvents\$Event")
-                                        
-                                        val resumeEvent = eventClass.newInstance()
-                                        XposedHelpers.setObjectField(resumeEvent, "mPackage", pkgName)
-                                        XposedHelpers.setIntField(resumeEvent, "mEventType", 1) 
-                                        XposedHelpers.setLongField(resumeEvent, "mTimeStamp", fakeStartTime)
-
-                                        val pauseEvent = eventClass.newInstance()
-                                        XposedHelpers.setObjectField(pauseEvent, "mPackage", pkgName)
-                                        XposedHelpers.setIntField(pauseEvent, "mEventType", 2) 
-                                        XposedHelpers.setLongField(pauseEvent, "mTimeStamp", fakeEndTime)
-
-                                        filteredEvents.add(resumeEvent)
-                                        filteredEvents.add(pauseEvent)
-                                        XposedBridge.log("[GodMode] ðŸ’‰ INJECTED $pkgName from ${formatTime(fakeStartTime)} to ${formatTime(fakeEndTime)}")
-                                    } catch (e: Exception) {
-                                        XposedBridge.log("[GodMode] âŒ Injection failed: ${e.message}")
-                                    }
-                                    currentInjectionAnchor = fakeEndTime + 1000L 
                                 }
                             }
                         }
 
+                        // PASS 3: Reorder the Universe
+                        // Trackers will instantly crash if events are out of chronological order.
                         filteredEvents.sortBy { XposedHelpers.getLongField(it, "mTimeStamp") }
 
+                        // Write our forged reality back to the event array
                         val newArrayType = eventsArray::class.java.componentType
                         if (newArrayType != null) {
                             val newEventsArray = java.lang.reflect.Array.newInstance(newArrayType, filteredEvents.size)
-                            for (i in 0 until filteredEvents.size) {
+                            for (i in filteredEvents.indices) {
                                 java.lang.reflect.Array.set(newEventsArray, i, filteredEvents[i])
                             }
                             XposedHelpers.setObjectField(usageEvents, "mEventsToWrite", newEventsArray)
