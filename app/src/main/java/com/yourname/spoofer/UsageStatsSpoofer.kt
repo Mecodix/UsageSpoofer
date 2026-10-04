@@ -18,12 +18,8 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
     }
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
-        // You can add more tracker packages here
-        val targetTrackers = listOf(
-            "com.google.android.apps.wellbeing", 
-            "com.samsung.android.forest"
-        )
-        if (!targetTrackers.contains(lpparam.packageName)) return
+        // Log exactly which app Vector just let us into (controlled by Vector Scope UI)
+        XposedBridge.log("[GodMode] 🟢 Successfully injected into: ${lpparam.packageName}")
 
         val prefs = XSharedPreferences("com.yourname.spoofer", "SpooferConfig")
         prefs.makeWorldReadable()
@@ -104,7 +100,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                         val usageEvents = param.result ?: return
                         val eventsArray = XposedHelpers.getObjectField(usageEvents, "mEventsToWrite") as? Array<*> ?: return
                         
-                        var filteredEvents = mutableListOf<Any>()
+                        val filteredEvents = mutableListOf<Any>()
                         
                         // Phase 1: Ghost Mode (HIDE) - Filter out events completely
                         for (event in eventsArray) {
@@ -175,6 +171,17 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                         // Phase 4: Repackage and return to tracker
                         val newArrayType = eventsArray::class.java.componentType
                         val newEventsArray = java.lang.reflect.Array.newInstance(newArrayType, filteredEvents.size)
+                        for (i in filteredEvents.indices) {
+                            java.lang.reflect.Array.set(newEventsArray, i, filteredEvents[i])
+                        }
+
+                        XposedHelpers.setObjectField(usageEvents, "mEventsToWrite", newEventsArray)
+                        XposedHelpers.setIntField(usageEvents, "mEventCount", filteredEvents.size)
+                    }
+                }
+            )
+        } catch (e: Exception) {
+            XposedBridge.lce(newArrayType, filteredEvents.size)
                         for (i in filteredEvents.indices) {
                             java.lang.reflect.Array.set(newEventsArray, i, filteredEvents[i])
                         }
