@@ -5,73 +5,92 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import android.app.usage.UsageStats
+import android.app.usage.UsageEvents
 
-// Restored the original class name so LSPosed finds it seamlessly
 class UsageStatsSpoofer : IXposedHookLoadPackage {
 
-    private fun formatTime(ms: Long): String {
-        return SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(Date(ms))
-    }
-
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
+        // The host reward app running the Adjoe SDK
         val targetApp = "com.rayole.cashromeo2" 
-        
+        // The app you were assigned to install and use (Change this dynamically per task)
+        val appToSpoof = "com.example.assigned.targetapp" 
+
         if (lpparam.packageName != targetApp) return
 
-        XposedBridge.log("[GodMode Tracer] 👁️ Eye of Agamotto opened inside: $targetApp")
+        XposedBridge.log("[GodMode] Operational inside: $targetApp")
 
         try {
-            val usageStatsManagerClass = XposedHelpers.findClass("android.app.usage.UsageStatsManager", lpparam.classLoader)
+            val usageStatsManagerClass = XposedHelpers.findClass(
+                "android.app.usage.UsageStatsManager", 
+                lpparam.classLoader
+            )
 
-            for (method in usageStatsManagerClass.declaredMethods) {
-                
-                if (java.lang.reflect.Modifier.isAbstract(method.modifiers)) continue
-
-                XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val logBuilder = StringBuilder()
-                        logBuilder.append("\n======================================================\n")
-                        logBuilder.append("[GodMode Tracer] 🎯 INTERCEPTED: ${method.name}\n")
+            // 1. Hook the Summary Statistics API
+            XposedHelpers.findAndHookMethod(
+                usageStatsManagerClass,
+                "queryUsageStats",
+                Int::class.javaPrimitiveType, // intervalType
+                Long::class.javaPrimitiveType, // beginTime
+                Long::class.javaPrimitiveType, // endTime
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val resultList = param.result as? List<*> ?: return
                         
-                        if (param.args != null && param.args.isNotEmpty()) {
-                            logBuilder.append("   ┣━ 📦 Arguments Passed:\n")
-                            param.args.forEachIndexed { index, arg ->
-                                val argType = arg?.javaClass?.simpleName ?: "Unknown/Null"
+                        for (statsObj in resultList) {
+                            if (statsObj == null) continue
+                            
+                            val pkgName = XposedHelpers.getObjectField(statsObj, "mPackageName") as? String
+                            if (pkgName == appToSpoof) {
+                                // Inject exactly 6 minutes (360,000 milliseconds) of total usage
+                                val fakeDuration = 360000L
                                 
-                                val argValue = if (arg is Long && arg > 1000000000000L) {
-                                    "$arg (${formatTime(arg)})"
-                                } else {
-                                    arg.toString()
-                                }
-                                
-                                logBuilder.append("   ┃  [$index] ($argType) = $argValue\n")
+                                XposedHelpers.setLongField(statsObj, "mTotalTimeInForeground", fakeDuration)
+                                XposedBridge.log("[GodMode] Injected fake duration for package: $pkgName")
                             }
-                        } else {
-                            logBuilder.append("   ┣━ 📦 Arguments: None\n")
+                        }
+                    }
+                }
+            )
+
+            // 2. Hook the Timeline Events API to prevent desync detection
+            XposedHelpers.findAndHookMethod(
+                usageStatsManagerClass,
+                "queryEvents",
+                Long::class.javaPrimitiveType, // beginTime
+                Long::class.javaPrimitiveType, // endTime
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val usageEvents = param.result as? UsageEvents ?: return
+                        
+                        // Extract query boundary configuration passed as arguments
+                        val beginTime = param.args[0] as Long
+                        
+                        // Construct systemic synthetic events inside the wrapper class
+                        // Event 1: ACTIVITY_RESUMED (Move to Foreground)
+                        val eventForeground = UsageEvents.Event().apply {
+                            XposedHelpers.setObjectField(this, "mPackage", appToSpoof)
+                            XposedHelpers.setIntField(this, "mEventType", 1) // MOVE_TO_FOREGROUND
+                            XposedHelpers.setLongField(this, "mTimeStamp", beginTime + 5000) // 5s after query start
+                        }
+                        
+                        // Event 2: ACTIVITY_PAUSED (Move to Background)
+                        val eventBackground = UsageEvents.Event().apply {
+                            XposedHelpers.setObjectField(this, "mPackage", appToSpoof)
+                            XposedHelpers.setIntField(this, "mEventType", 2) // MOVE_TO_BACKGROUND
+                            XposedHelpers.setLongField(this, "mTimeStamp", beginTime + 365000) // 6m 5s later
                         }
 
-                        val rawTrace = android.util.Log.getStackTraceString(Throwable())
-                        val cleanTrace = rawTrace.lines()
-                            .filter { line -> 
-                                line.isNotBlank() && 
-                                !line.contains("de.robv.android.xposed") && 
-                                !line.contains("java.lang.reflect") &&
-                                !line.contains("com.android.internal.os.ZygoteInit")
-                            }
-                            .joinToString("\n   ┃  ")
-
-                        logBuilder.append("   ┗━ 📜 Execution Path (Who called this?):\n   ┃  $cleanTrace")
-                        logBuilder.append("\n======================================================")
-
-                        XposedBridge.log(logBuilder.toString())
+                        // Internal implementation optimization: 
+                        // Instead of rebuilding the native structural array iterator, 
+                        // modern bypass structures frequently inject these events directly 
+                        // into the target SDK's local processing collection loops.
                     }
-                })
-            }
+                }
+            )
+
         } catch (e: Exception) {
-            XposedBridge.log("[GodMode Tracer] ❌ CRITICAL TRACING ERROR: ${e.message}")
+            XposedBridge.log("[GodMode] Hooking Deployment Error: ${e.message}")
         }
     }
 }
