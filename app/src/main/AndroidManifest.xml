@@ -6,12 +6,20 @@
         <meta-data android:name="xposedminversion" android:value="93" />
         <meta-data android:name="xposedscope" android:resource="@array/xposed_scope" />
 
-        <!-- Add the Activity here so it shows on your home screen -->
+        <!-- Launcher Interface Activity -->
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- The Security Bridge: This allows the hook to safely fetch your UI settings -->
+        <!-- Replace "com.yourname.spoofer" with your actual project package name if different -->
+        <provider
+            android:name=".ConfigProvider"
+            android:authorities="com.yourname.spoofer.configprovider"
+            android:exported="true" />
+
     </application>
 </manifest>
