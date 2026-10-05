@@ -139,10 +139,10 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                             XposedHelpers.setLongField(statsObj, "mBeginTimeStamp", queryBeginTime)
                             XposedHelpers.setLongField(statsObj, "mEndTimeStamp", queryEndTime)
 
-                            // Fix "Last Seen" disconnect — update last used/visible timestamps
+                            // Fix "Last Seen" disconnect — anchor to tail end of query window
                             // so the tracker doesn't see a contradiction between total time and last seen
-                            XposedHelpers.setLongField(statsObj, "mLastTimeUsed", queryEndTime)
-                            XposedHelpers.setLongField(statsObj, "mLastTimeVisible", queryEndTime)
+                            XposedHelpers.setLongField(statsObj, "mLastTimeUsed", queryEndTime - 2000L)
+                            XposedHelpers.setLongField(statsObj, "mLastTimeVisible", queryEndTime - 2000L)
 
                             // Log all hidden fields for audit (compare real vs spoof sessions)
                             XposedBridge.log("[GodMode] === FIELD AUDIT for $pkgName ===")
