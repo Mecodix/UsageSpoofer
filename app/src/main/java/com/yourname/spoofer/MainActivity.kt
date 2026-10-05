@@ -43,6 +43,8 @@ class MainActivity : Activity() {
         val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, modes)
         modeSpinner.adapter = adapter
         
+        val prefs = getSharedPreferences("SpooferConfigPrivate", Context.MODE_PRIVATE)
+
         // Enable/Disable toggle
         val toggleSwitch = Switch(this).apply {
             text = "Spoofer Enabled"
@@ -62,8 +64,6 @@ class MainActivity : Activity() {
         layout.addView(modeSpinner)
         layout.addView(saveBtn)
         setContentView(layout)
-
-        val prefs = getSharedPreferences("SpooferConfigPrivate", Context.MODE_PRIVATE)
 
         saveBtn.setOnClickListener {
             val pkg = pkgInput.text.toString().trim()
