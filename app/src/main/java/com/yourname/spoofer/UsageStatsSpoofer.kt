@@ -34,6 +34,38 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         return ""
     }
 
+    /**
+     * Dynamically scans UsageEvents fields to find the event container.
+     * Field names vary across OEM ROMs and Android versions (mEventList, mEvents, etc.).
+     * Returns the first field that is a List or Array, or null if none found.
+     */
+    private fun findEventContainer(usageEvents: UsageEvents): ArrayList<Any>? {
+        try {
+            val fields = usageEvents.javaClass.declaredFields
+            for (field in fields) {
+                field.isAccessible = true
+                val value = field.get(usageEvents) ?: continue
+                // Check if it's a List or Array
+                if (value is List<*>) {
+                    @Suppress("UNCHECKED_CAST")
+                    return value as? ArrayList<Any>
+                }
+                if (value.isArray()) {
+                    // Convert array to ArrayList
+                    val list = ArrayList<Any>()
+                    val length = java.lang.reflect.Array.getLength(value)
+                    for (i in 0 until length) {
+                        java.lang.reflect.Array.get(value, i)?.let { list.add(it) }
+                    }
+                    return list
+                }
+            }
+        } catch (e: Exception) {
+            XposedBridge.log("[GodMode] findEventContainer error: ${e.message}")
+        }
+        return null
+    }
+
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
         // The host tracker application processing the telemetry SDK
         val hostApp = "com.rayole.cashromeo2" 
@@ -119,66 +151,73 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 Long::class.javaPrimitiveType, // endTime
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        val queryBeginTime = param.args[0] as Long
-                        val queryEndTime = param.args[1] as Long
-                        val usageEvents = param.result as? UsageEvents ?: return
+                        try {
+                            val queryBeginTime = param.args[0] as Long
+                            val queryEndTime = param.args[1] as Long
+                            val usageEvents = param.result as? UsageEvents ?: return
 
-                        // Get config for target package
-                        val targetPkg = getRemoteConfig("", "target_package_to_spoof")
-                        if (targetPkg.isEmpty()) return
+                            // Get config for target package
+                            val targetPkg = getRemoteConfig("", "target_package_to_spoof")
+                            if (targetPkg.isEmpty()) return
 
-                        val savedTimeMsStr = getRemoteConfig("", "time")
-                        val modeStr = getRemoteConfig("", "mode")
+                            val savedTimeMsStr = getRemoteConfig("", "time")
+                            val modeStr = getRemoteConfig("", "mode")
 
-                        val inputDurationMs = savedTimeMsStr.toLongOrNull() ?: 360000L
-                        val mode = modeStr.toIntOrNull() ?: 0
+                            val inputDurationMs = savedTimeMsStr.toLongOrNull() ?: 360000L
+                            val mode = modeStr.toIntOrNull() ?: 0
 
-                        // Access the private mEventList field inside UsageEvents
-                        val eventListField = XposedHelpers.findField(usageEvents.javaClass, "mEventList")
-                        @Suppress("UNCHECKED_CAST")
-                        val eventList = eventListField.get(usageEvents) as ArrayList<Any>
-
-                        when (mode) {
-                            2 -> { // HIDE mode: remove all events for target package
-                                eventList.removeAll { event ->
-                                    val pkg = XposedHelpers.getObjectField(event, "mPackage") as? String
-                                    pkg == targetPkg
-                                }
-                                XposedBridge.log("[GodMode] HIDE mode: cleared events for $targetPkg")
+                            // Dynamically scan UsageEvents fields to find the event container
+                            // (field names vary across OEM ROMs and Android versions)
+                            val eventContainer = findEventContainer(usageEvents)
+                            if (eventContainer == null) {
+                                XposedBridge.log("[GodMode] Could not find event container in UsageEvents")
+                                return
                             }
-                            else -> { // SET or ADD mode: inject fake events
-                                val eventClass = XposedHelpers.findClass(
-                                    "android.app.usage.UsageEvents\$Event",
-                                    usageEvents.javaClass.classLoader
-                                )
 
-                                val maxAvailableWindow = queryEndTime - queryBeginTime
-                                var durationMs = inputDurationMs
-                                if (mode == 0 && durationMs > maxAvailableWindow) {
-                                    durationMs = maxAvailableWindow - 5000L
+                            when (mode) {
+                                2 -> { // HIDE mode: remove all events for target package
+                                    eventContainer.removeAll { event ->
+                                        val pkg = XposedHelpers.getObjectField(event, "mPackage") as? String
+                                        pkg == targetPkg
+                                    }
+                                    XposedBridge.log("[GodMode] HIDE mode: cleared events for $targetPkg")
                                 }
+                                else -> { // SET or ADD mode: inject fake events
+                                    val eventClass = XposedHelpers.findClass(
+                                        "android.app.usage.UsageEvents\$Event",
+                                        usageEvents.javaClass.classLoader
+                                    )
 
-                                val foregroundTime = queryBeginTime
-                                val backgroundTime = (queryBeginTime + durationMs).coerceAtMost(queryEndTime)
+                                    val maxAvailableWindow = queryEndTime - queryBeginTime
+                                    var durationMs = inputDurationMs
+                                    if (mode == 0 && durationMs > maxAvailableWindow) {
+                                        durationMs = maxAvailableWindow - 5000L
+                                    }
 
-                                // Create foreground event (ACTIVITY_RESUMED)
-                                val eventForeground = eventClass.newInstance()
-                                XposedHelpers.setObjectField(eventForeground, "mPackage", targetPkg)
-                                XposedHelpers.setLongField(eventForeground, "mTimeStamp", foregroundTime)
-                                XposedHelpers.setIntField(eventForeground, "mEventType", 1)
+                                    val foregroundTime = queryBeginTime
+                                    val backgroundTime = (queryBeginTime + durationMs).coerceAtMost(queryEndTime)
 
-                                // Create background event (ACTIVITY_PAUSED)
-                                val eventBackground = eventClass.newInstance()
-                                XposedHelpers.setObjectField(eventBackground, "mPackage", targetPkg)
-                                XposedHelpers.setLongField(eventBackground, "mTimeStamp", backgroundTime)
-                                XposedHelpers.setIntField(eventBackground, "mEventType", 2)
+                                    // Create foreground event (ACTIVITY_RESUMED)
+                                    val eventForeground = eventClass.newInstance()
+                                    XposedHelpers.setObjectField(eventForeground, "mPackage", targetPkg)
+                                    XposedHelpers.setLongField(eventForeground, "mTimeStamp", foregroundTime)
+                                    XposedHelpers.setIntField(eventForeground, "mEventType", 1)
 
-                                // Inject into the system's internal event list
-                                eventList.add(eventForeground)
-                                eventList.add(eventBackground)
+                                    // Create background event (ACTIVITY_PAUSED)
+                                    val eventBackground = eventClass.newInstance()
+                                    XposedHelpers.setObjectField(eventBackground, "mPackage", targetPkg)
+                                    XposedHelpers.setLongField(eventBackground, "mTimeStamp", backgroundTime)
+                                    XposedHelpers.setIntField(eventBackground, "mEventType", 2)
 
-                                XposedBridge.log("[GodMode] Injected foreground+background events for $targetPkg (${durationMs}ms)")
+                                    // Inject into the system's internal event list
+                                    eventContainer.add(eventForeground)
+                                    eventContainer.add(eventBackground)
+
+                                    XposedBridge.log("[GodMode] Injected foreground+background events for $targetPkg (${durationMs}ms)")
+                                }
                             }
+                        } catch (e: Exception) {
+                            XposedBridge.log("[GodMode] queryEvents hook error: ${e.message}")
                         }
                     }
                 }
