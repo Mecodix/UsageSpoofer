@@ -134,7 +134,21 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                             XposedHelpers.setLongField(statsObj, "mTotalTimeInForeground", finalDurationMs)
                             XposedHelpers.setLongField(statsObj, "mBeginTimeStamp", queryBeginTime)
                             XposedHelpers.setLongField(statsObj, "mEndTimeStamp", queryEndTime)
-                            
+
+                            // Fix "Last Seen" disconnect — update last used/visible timestamps
+                            // so the tracker doesn't see a contradiction between total time and last seen
+                            XposedHelpers.setLongField(statsObj, "mLastTimeUsed", queryEndTime)
+                            XposedHelpers.setLongField(statsObj, "mLastTimeVisible", queryEndTime)
+
+                            // Log all hidden fields for audit (compare real vs spoof sessions)
+                            XposedBridge.log("[GodMode] === FIELD AUDIT for $pkgName ===")
+                            XposedBridge.log("[GodMode] mPackageName: $pkgName")
+                            XposedBridge.log("[GodMode] mTotalTimeInForeground: ${XposedHelpers.getLongField(statsObj, "mTotalTimeInForeground")}")
+                            XposedBridge.log("[GodMode] mLastTimeUsed: ${XposedHelpers.getLongField(statsObj, "mLastTimeUsed")}")
+                            XposedBridge.log("[GodMode] mLastTimeVisible: ${XposedHelpers.getLongField(statsObj, "mLastTimeVisible")}")
+                            XposedBridge.log("[GodMode] mAppLaunchCount: ${XposedHelpers.getIntField(statsObj, "mAppLaunchCount")}")
+                            XposedBridge.log("[GodMode] mBeginTimeStamp: ${XposedHelpers.getLongField(statsObj, "mBeginTimeStamp")}")
+                            XposedBridge.log("[GodMode] mEndTimeStamp: ${XposedHelpers.getLongField(statsObj, "mEndTimeStamp")}")
                             XposedBridge.log("[GodMode] Successfully applied mode $mode to summary statistics for: $pkgName")
                         }
                     }
@@ -220,6 +234,14 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                                     eventContainer.add(eventTouch)
                                     eventContainer.add(eventBackground)
 
+                                    // Timeline audit log — dump all injected events for comparison
+                                    XposedBridge.log("[GodMode] === TIMELINE AUDIT for $targetPkg ===")
+                                    for ((index, event) in eventContainer.withIndex()) {
+                                        val pkg = XposedHelpers.getObjectField(event, "mPackage") as? String ?: "?"
+                                        val ts = XposedHelpers.getLongField(event, "mTimeStamp")
+                                        val type = XposedHelpers.getIntField(event, "mEventType")
+                                        XposedBridge.log("[GodMode] Event[$index]: pkg=$pkg, type=$type, timestamp=$ts")
+                                    }
                                     XposedBridge.log("[GodMode] Injected foreground+touch+background events for $targetPkg (${durationMs}ms)")
                                 }
                             }
