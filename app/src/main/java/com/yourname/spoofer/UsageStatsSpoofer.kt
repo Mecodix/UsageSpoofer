@@ -50,7 +50,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                     @Suppress("UNCHECKED_CAST")
                     return value as? ArrayList<Any>
                 }
-                if (value.isArray()) {
+                if (value.javaClass.isArray) {
                     // Convert array to ArrayList
                     val list = ArrayList<Any>()
                     val length = java.lang.reflect.Array.getLength(value)
