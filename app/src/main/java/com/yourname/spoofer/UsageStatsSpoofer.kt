@@ -123,9 +123,63 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                         val queryEndTime = param.args[1] as Long
                         val usageEvents = param.result as? UsageEvents ?: return
 
-                        // Since queryEvents returns an aggregate collection instance, we can trace inside the sequence loop
-                        // to assert structural milestones for configured packages matching your overnight window shifts.
-                        XposedBridge.log("[GodMode] Parsing dynamic query execution path across event loops.")
+                        // Get config for target package
+                        val targetPkg = getRemoteConfig("", "target_package_to_spoof")
+                        if (targetPkg.isEmpty()) return
+
+                        val savedTimeMsStr = getRemoteConfig("", "time")
+                        val modeStr = getRemoteConfig("", "mode")
+
+                        val inputDurationMs = savedTimeMsStr.toLongOrNull() ?: 360000L
+                        val mode = modeStr.toIntOrNull() ?: 0
+
+                        // Access the private mEventList field inside UsageEvents
+                        val eventListField = XposedHelpers.findField(usageEvents.javaClass, "mEventList")
+                        @Suppress("UNCHECKED_CAST")
+                        val eventList = eventListField.get(usageEvents) as ArrayList<Any>
+
+                        when (mode) {
+                            2 -> { // HIDE mode: remove all events for target package
+                                eventList.removeAll { event ->
+                                    val pkg = XposedHelpers.getObjectField(event, "mPackage") as? String
+                                    pkg == targetPkg
+                                }
+                                XposedBridge.log("[GodMode] HIDE mode: cleared events for $targetPkg")
+                            }
+                            else -> { // SET or ADD mode: inject fake events
+                                val eventClass = XposedHelpers.findClass(
+                                    "android.app.usage.UsageEvents\$Event",
+                                    usageEvents.javaClass.classLoader
+                                )
+
+                                val maxAvailableWindow = queryEndTime - queryBeginTime
+                                var durationMs = inputDurationMs
+                                if (mode == 0 && durationMs > maxAvailableWindow) {
+                                    durationMs = maxAvailableWindow - 5000L
+                                }
+
+                                val foregroundTime = queryBeginTime
+                                val backgroundTime = (queryBeginTime + durationMs).coerceAtMost(queryEndTime)
+
+                                // Create foreground event (ACTIVITY_RESUMED)
+                                val eventForeground = eventClass.newInstance()
+                                XposedHelpers.setObjectField(eventForeground, "mPackage", targetPkg)
+                                XposedHelpers.setLongField(eventForeground, "mTimeStamp", foregroundTime)
+                                XposedHelpers.setIntField(eventForeground, "mEventType", 1)
+
+                                // Create background event (ACTIVITY_PAUSED)
+                                val eventBackground = eventClass.newInstance()
+                                XposedHelpers.setObjectField(eventBackground, "mPackage", targetPkg)
+                                XposedHelpers.setLongField(eventBackground, "mTimeStamp", backgroundTime)
+                                XposedHelpers.setIntField(eventBackground, "mEventType", 2)
+
+                                // Inject into the system's internal event list
+                                eventList.add(eventForeground)
+                                eventList.add(eventBackground)
+
+                                XposedBridge.log("[GodMode] Injected foreground+background events for $targetPkg (${durationMs}ms)")
+                            }
+                        }
                     }
                 }
             )
