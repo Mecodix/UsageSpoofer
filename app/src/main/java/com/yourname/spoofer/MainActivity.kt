@@ -43,35 +43,42 @@ class MainActivity : Activity() {
         val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, modes)
         modeSpinner.adapter = adapter
         
-        val saveBtn = Button(this).apply { 
-            text = "SAVE CONFIGURATION" 
+        // Enable/Disable toggle
+        val toggleSwitch = Switch(this).apply {
+            text = "Spoofer Enabled"
+            setTextColor(Color.WHITE)
+            isChecked = prefs.getBoolean("spoofer_enabled", true)
+        }
+
+        val saveBtn = Button(this).apply {
+            text = "SAVE CONFIGURATION"
             setBackgroundColor(Color.parseColor("#BB86FC"))
         }
-        
+
         layout.addView(title)
+        layout.addView(toggleSwitch)
         layout.addView(pkgInput)
         layout.addView(timeInput)
         layout.addView(modeSpinner)
         layout.addView(saveBtn)
         setContentView(layout)
-        
-        // CHANGED: Fixed the crash by using MODE_PRIVATE instead of WORLD_READABLE
+
         val prefs = getSharedPreferences("SpooferConfigPrivate", Context.MODE_PRIVATE)
-        
+
         saveBtn.setOnClickListener {
             val pkg = pkgInput.text.toString().trim()
             val minutes = timeInput.text.toString().toLongOrNull() ?: 0L
             val mode = modeSpinner.selectedItemPosition
-            
-            if (pkg.isNotEmpty()) {
-                prefs.edit().apply {
-                    putString("target_package_to_spoof", pkg)
-                    putLong("custom_spoof_minutes", minutes)
-                    putInt("spoof_mode", mode)
-                    apply()
-                }
-                Toast.makeText(this, "Saved successfully!", Toast.LENGTH_LONG).show()
+            val enabled = toggleSwitch.isChecked
+
+            prefs.edit().apply {
+                putString("target_package_to_spoof", pkg)
+                putLong("custom_spoof_minutes", minutes)
+                putInt("spoof_mode", mode)
+                putBoolean("spoofer_enabled", enabled)
+                apply()
             }
+            Toast.makeText(this, "Saved successfully!", Toast.LENGTH_LONG).show()
         }
     }
 }

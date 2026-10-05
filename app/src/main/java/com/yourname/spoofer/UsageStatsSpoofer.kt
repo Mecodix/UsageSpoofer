@@ -91,6 +91,10 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 Long::class.javaPrimitiveType, // endTime
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
+                        // Check if spoofer is enabled
+                        val isEnabled = getRemoteConfig("", "spoofer_enabled")
+                        if (isEnabled == "false") return
+
                         val queryBeginTime = param.args[1] as Long
                         val queryEndTime = param.args[2] as Long
                         val resultList = param.result as? List<*> ?: return
@@ -166,6 +170,10 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
+                            // Check if spoofer is enabled
+                            val isEnabled = getRemoteConfig("", "spoofer_enabled")
+                            if (isEnabled == "false") return
+
                             val queryBeginTime = param.args[0] as Long
                             val queryEndTime = param.args[1] as Long
                             val usageEvents = param.result as? UsageEvents ?: return

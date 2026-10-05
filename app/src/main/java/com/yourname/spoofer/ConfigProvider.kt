@@ -19,6 +19,7 @@ class ConfigProvider : ContentProvider() {
         cursor.addRow(arrayOf("target_package_to_spoof", prefs.getString("target_package_to_spoof", "")))
         cursor.addRow(arrayOf("custom_spoof_minutes", prefs.getLong("custom_spoof_minutes", 0L).toString()))
         cursor.addRow(arrayOf("spoof_mode", prefs.getInt("spoof_mode", 0).toString()))
+        cursor.addRow(arrayOf("spoofer_enabled", prefs.getBoolean("spoofer_enabled", true).toString()))
         return cursor
     }
 
