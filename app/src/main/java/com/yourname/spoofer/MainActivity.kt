@@ -2,21 +2,21 @@ package com.yourname.spoofer
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.ContentValues
 import android.content.Context
 import android.os.Bundle
 import android.widget.*
 import android.graphics.Color
+import android.net.Uri
 
 class MainActivity : Activity() {
-    @SuppressLint("WorldReadableFiles")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // Build a simple UI using code (No XML needed!)
         val layout = LinearLayout(this).apply { 
             orientation = LinearLayout.VERTICAL
             setPadding(60, 100, 60, 60)
-            setBackgroundColor(Color.parseColor("#121212")) // Dark Mode
+            setBackgroundColor(Color.parseColor("#121212")) 
         }
         
         val title = TextView(this).apply { 
@@ -27,7 +27,7 @@ class MainActivity : Activity() {
         }
         
         val pkgInput = EditText(this).apply { 
-            hint = "App Package (e.g., com.google.android.youtube)"
+            hint = "App Package (e.g., com.rayole.target)"
             setTextColor(Color.WHITE)
             setHintTextColor(Color.GRAY)
         }
@@ -40,7 +40,6 @@ class MainActivity : Activity() {
         }
 
         val modeSpinner = Spinner(this)
-        // Modes: SET exact time, ADD to real time, HIDE completely
         val modes = arrayOf("SET (Overwrite exact time)", "ADD (Increase real time)", "HIDE (Ghost Mode)")
         val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, modes)
         modeSpinner.adapter = adapter
@@ -57,23 +56,22 @@ class MainActivity : Activity() {
         layout.addView(saveBtn)
         setContentView(layout)
         
-        // This is where the magic bridge happens. 
-        // MODE_WORLD_READABLE allows LSPosed to read this config from another app.
-        val prefs = getSharedPreferences("SpooferConfig", Context.MODE_WORLD_READABLE)
-        
         saveBtn.setOnClickListener {
             val pkg = pkgInput.text.toString().trim()
             val minutes = timeInput.text.toString().toLongOrNull() ?: 0L
             val mode = modeSpinner.selectedItemPosition
             
             if (pkg.isNotEmpty()) {
-                prefs.edit().apply {
-                    putLong("${pkg}_time", minutes * 60000L) // Convert mins to milliseconds
-                    putInt("${pkg}_mode", mode)
-                    putBoolean("${pkg}_active", true)
+                // Save configurations to a secure local SharedPreferences file inside the UI process
+                val localPrefs = getSharedPreferences("SpooferConfigPrivate", Context.MODE_PRIVATE)
+                localPrefs.edit().apply {
+                    putString("target_package_to_spoof", pkg)
+                    putLong("custom_spoof_minutes", minutes)
+                    putInt("spoof_mode", mode)
                     apply()
                 }
-                Toast.makeText(this, "Saved! Open Digital Wellbeing to see changes.", Toast.LENGTH_LONG).show()
+                
+                Toast.makeText(this, "Configuration Active for $pkg", Toast.LENGTH_LONG).show()
             }
         }
     }
