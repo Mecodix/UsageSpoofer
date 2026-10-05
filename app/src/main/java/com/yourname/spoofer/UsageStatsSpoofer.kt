@@ -100,13 +100,13 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                             
                             val pkgName = XposedHelpers.getObjectField(statsObj, "mPackageName") as? String ?: continue
                             
-                            // Check if this specific package has a configuration active in your UI app
-                            val isActive = getRemoteConfig(pkgName, "active")
-                            if (isActive != "true") continue
+                            // Check if this package matches our target directly
+                            val appToSpoof = getRemoteConfig("", "target_package_to_spoof")
+                            if (pkgName != appToSpoof) continue
 
                             // Safely retrieve the dynamic duration configurations set via your UI spinner/input
-                            val savedTimeMsStr = getRemoteConfig(pkgName, "time")
-                            val modeStr = getRemoteConfig(pkgName, "mode")
+                            val savedTimeMsStr = getRemoteConfig("", "time")
+                            val modeStr = getRemoteConfig("", "mode")
                             
                             val inputDurationMs = savedTimeMsStr.toLongOrNull() ?: 360000L // Defaults to 6 mins
                             val mode = modeStr.toIntOrNull() ?: 0 // 0 = SET, 1 = ADD, 2 = HIDE
@@ -203,17 +203,24 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                                     XposedHelpers.setLongField(eventForeground, "mTimeStamp", foregroundTime)
                                     XposedHelpers.setIntField(eventForeground, "mEventType", 1)
 
+                                    // Create touch event (USER_INTERACTION) - proves human usage
+                                    val eventTouch = eventClass.newInstance()
+                                    XposedHelpers.setObjectField(eventTouch, "mPackage", targetPkg)
+                                    XposedHelpers.setLongField(eventTouch, "mTimeStamp", foregroundTime + 2500L)
+                                    XposedHelpers.setIntField(eventTouch, "mEventType", 7)
+
                                     // Create background event (ACTIVITY_PAUSED)
                                     val eventBackground = eventClass.newInstance()
                                     XposedHelpers.setObjectField(eventBackground, "mPackage", targetPkg)
                                     XposedHelpers.setLongField(eventBackground, "mTimeStamp", backgroundTime)
                                     XposedHelpers.setIntField(eventBackground, "mEventType", 2)
 
-                                    // Inject into the system's internal event list
+                                    // Inject all three into the system's internal event list
                                     eventContainer.add(eventForeground)
+                                    eventContainer.add(eventTouch)
                                     eventContainer.add(eventBackground)
 
-                                    XposedBridge.log("[GodMode] Injected foreground+background events for $targetPkg (${durationMs}ms)")
+                                    XposedBridge.log("[GodMode] Injected foreground+touch+background events for $targetPkg (${durationMs}ms)")
                                 }
                             }
                         } catch (e: Exception) {
