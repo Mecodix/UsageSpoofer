@@ -134,15 +134,21 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                                 }
                             }
 
+                            // Calculate timestamps that are mathematically consistent with events
+                            val sessionStart = queryBeginTime + 500L
+                            val sessionEnd = (queryBeginTime + finalDurationMs).coerceAtMost(queryEndTime)
+
                             // Modify the summary analytics payload fields inside memory
                             XposedHelpers.setLongField(statsObj, "mTotalTimeInForeground", finalDurationMs)
-                            XposedHelpers.setLongField(statsObj, "mBeginTimeStamp", queryBeginTime)
-                            XposedHelpers.setLongField(statsObj, "mEndTimeStamp", queryEndTime)
+                            XposedHelpers.setLongField(statsObj, "mBeginTimeStamp", sessionStart)
+                            XposedHelpers.setLongField(statsObj, "mEndTimeStamp", sessionEnd)
 
-                            // Fix "Last Seen" disconnect — anchor to tail end of query window
-                            // so the tracker doesn't see a contradiction between total time and last seen
-                            XposedHelpers.setLongField(statsObj, "mLastTimeUsed", queryEndTime - 2000L)
-                            XposedHelpers.setLongField(statsObj, "mLastTimeVisible", queryEndTime - 2000L)
+                            // Fix "Last Seen" disconnect — anchor to session end
+                            XposedHelpers.setLongField(statsObj, "mLastTimeUsed", sessionEnd - 2000L)
+                            XposedHelpers.setLongField(statsObj, "mLastTimeVisible", sessionEnd - 2000L)
+
+                            // Set launch count to 1 (one foreground session)
+                            XposedHelpers.setIntField(statsObj, "mAppLaunchCount", 1)
 
                             // Log all hidden fields for audit (compare real vs spoof sessions)
                             XposedBridge.log("[GodMode] === FIELD AUDIT for $pkgName ===")
@@ -204,7 +210,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                                     }
                                     XposedBridge.log("[GodMode] HIDE mode: cleared events for $targetPkg")
                                 }
-                                else -> { // SET or ADD mode: inject fake events
+                                else -> { // SET or ADD mode: inject realistic event sequence
                                     val eventClass = XposedHelpers.findClass(
                                         "android.app.usage.UsageEvents\$Event",
                                         usageEvents.javaClass.classLoader
@@ -218,39 +224,76 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
 
                                     val foregroundTime = queryBeginTime
                                     val backgroundTime = (queryBeginTime + durationMs).coerceAtMost(queryEndTime)
+                                    val className = "$targetPkg.MainActivity"
 
-                                    // Create foreground event (ACTIVITY_RESUMED)
+                                    val injectedEvents = mutableListOf<Any>()
+
+                                    // 1. Screen turns on
+                                    val eventScreenOn = eventClass.newInstance()
+                                    XposedHelpers.setObjectField(eventScreenOn, "mPackage", "android")
+                                    XposedHelpers.setLongField(eventScreenOn, "mTimeStamp", foregroundTime)
+                                    XposedHelpers.setIntField(eventScreenOn, "mEventType", 13) // SCREEN_INTERACTIVE
+                                    injectedEvents.add(eventScreenOn)
+
+                                    // 2. App moves to foreground
                                     val eventForeground = eventClass.newInstance()
                                     XposedHelpers.setObjectField(eventForeground, "mPackage", targetPkg)
-                                    XposedHelpers.setLongField(eventForeground, "mTimeStamp", foregroundTime)
-                                    XposedHelpers.setIntField(eventForeground, "mEventType", 1)
+                                    XposedHelpers.setObjectField(eventForeground, "mClass", className)
+                                    XposedHelpers.setLongField(eventForeground, "mTimeStamp", foregroundTime + 500L)
+                                    XposedHelpers.setIntField(eventForeground, "mEventType", 1) // ACTIVITY_RESUMED
+                                    injectedEvents.add(eventForeground)
 
-                                    // Create touch event (USER_INTERACTION) - proves human usage
-                                    val eventTouch = eventClass.newInstance()
-                                    XposedHelpers.setObjectField(eventTouch, "mPackage", targetPkg)
-                                    XposedHelpers.setLongField(eventTouch, "mTimeStamp", foregroundTime + 2500L)
-                                    XposedHelpers.setIntField(eventTouch, "mEventType", 7)
+                                    // 3. User interaction events every 5-10 seconds
+                                    var currentTime = foregroundTime + 5000L
+                                    val random = java.util.Random()
+                                    while (currentTime < backgroundTime - 5000L) {
+                                        val eventTouch = eventClass.newInstance()
+                                        XposedHelpers.setObjectField(eventTouch, "mPackage", targetPkg)
+                                        XposedHelpers.setObjectField(eventTouch, "mClass", className)
+                                        XposedHelpers.setLongField(eventTouch, "mTimeStamp", currentTime)
+                                        XposedHelpers.setIntField(eventTouch, "mEventType", 7) // USER_INTERACTION
+                                        injectedEvents.add(eventTouch)
+                                        currentTime += 5000L + random.nextInt(5000)
+                                    }
 
-                                    // Create background event (ACTIVITY_PAUSED)
+                                    // 4. Configuration change (screen rotation, etc.)
+                                    if (durationMs > 30000) {
+                                        val eventConfig = eventClass.newInstance()
+                                        XposedHelpers.setObjectField(eventConfig, "mPackage", targetPkg)
+                                        XposedHelpers.setObjectField(eventConfig, "mClass", className)
+                                        XposedHelpers.setLongField(eventConfig, "mTimeStamp", foregroundTime + durationMs / 2)
+                                        XposedHelpers.setIntField(eventConfig, "mEventType", 5) // CONFIGURATION_CHANGE
+                                        injectedEvents.add(eventConfig)
+                                    }
+
+                                    // 5. App moves to background
                                     val eventBackground = eventClass.newInstance()
                                     XposedHelpers.setObjectField(eventBackground, "mPackage", targetPkg)
+                                    XposedHelpers.setObjectField(eventBackground, "mClass", className)
                                     XposedHelpers.setLongField(eventBackground, "mTimeStamp", backgroundTime)
-                                    XposedHelpers.setIntField(eventBackground, "mEventType", 2)
+                                    XposedHelpers.setIntField(eventBackground, "mEventType", 2) // ACTIVITY_PAUSED
+                                    injectedEvents.add(eventBackground)
 
-                                    // Inject all three into the system's internal event list
-                                    eventContainer.add(eventForeground)
-                                    eventContainer.add(eventTouch)
-                                    eventContainer.add(eventBackground)
+                                    // 6. Screen turns off
+                                    val eventScreenOff = eventClass.newInstance()
+                                    XposedHelpers.setObjectField(eventScreenOff, "mPackage", "android")
+                                    XposedHelpers.setLongField(eventScreenOff, "mTimeStamp", backgroundTime + 500L)
+                                    XposedHelpers.setIntField(eventScreenOff, "mEventType", 14) // SCREEN_NON_INTERACTIVE
+                                    injectedEvents.add(eventScreenOff)
 
-                                    // Timeline audit log — dump all injected events for comparison
+                                    // Sort by timestamp and inject
+                                    injectedEvents.sortBy { XposedHelpers.getLongField(it, "mTimeStamp") }
+                                    eventContainer.addAll(injectedEvents)
+
+                                    // Timeline audit log
                                     XposedBridge.log("[GodMode] === TIMELINE AUDIT for $targetPkg ===")
-                                    for ((index, event) in eventContainer.withIndex()) {
+                                    for ((index, event) in injectedEvents.withIndex()) {
                                         val pkg = XposedHelpers.getObjectField(event, "mPackage") as? String ?: "?"
                                         val ts = XposedHelpers.getLongField(event, "mTimeStamp")
                                         val type = XposedHelpers.getIntField(event, "mEventType")
                                         XposedBridge.log("[GodMode] Event[$index]: pkg=$pkg, type=$type, timestamp=$ts")
                                     }
-                                    XposedBridge.log("[GodMode] Injected foreground+touch+background events for $targetPkg (${durationMs}ms)")
+                                    XposedBridge.log("[GodMode] Injected ${injectedEvents.size} events for $targetPkg (${durationMs}ms)")
                                 }
                             }
                         } catch (e: Exception) {
