@@ -2,21 +2,20 @@ package com.yourname.spoofer
 
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.content.ContentValues
 import android.content.Context
 import android.os.Bundle
 import android.widget.*
 import android.graphics.Color
-import android.net.Uri
 
 class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
+        // Build the layout UI
         val layout = LinearLayout(this).apply { 
             orientation = LinearLayout.VERTICAL
             setPadding(60, 100, 60, 60)
-            setBackgroundColor(Color.parseColor("#121212")) 
+            setBackgroundColor(Color.parseColor("#121212")) // Dark Mode
         }
         
         val title = TextView(this).apply { 
@@ -27,7 +26,7 @@ class MainActivity : Activity() {
         }
         
         val pkgInput = EditText(this).apply { 
-            hint = "App Package (e.g., com.rayole.target)"
+            hint = "App Package (e.g., com.google.android.youtube)"
             setTextColor(Color.WHITE)
             setHintTextColor(Color.GRAY)
         }
@@ -56,22 +55,22 @@ class MainActivity : Activity() {
         layout.addView(saveBtn)
         setContentView(layout)
         
+        // CHANGED: Fixed the crash by using MODE_PRIVATE instead of WORLD_READABLE
+        val prefs = getSharedPreferences("SpooferConfigPrivate", Context.MODE_PRIVATE)
+        
         saveBtn.setOnClickListener {
             val pkg = pkgInput.text.toString().trim()
             val minutes = timeInput.text.toString().toLongOrNull() ?: 0L
             val mode = modeSpinner.selectedItemPosition
             
             if (pkg.isNotEmpty()) {
-                // Save configurations to a secure local SharedPreferences file inside the UI process
-                val localPrefs = getSharedPreferences("SpooferConfigPrivate", Context.MODE_PRIVATE)
-                localPrefs.edit().apply {
+                prefs.edit().apply {
                     putString("target_package_to_spoof", pkg)
                     putLong("custom_spoof_minutes", minutes)
                     putInt("spoof_mode", mode)
                     apply()
                 }
-                
-                Toast.makeText(this, "Configuration Active for $pkg", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "Saved successfully!", Toast.LENGTH_LONG).show()
             }
         }
     }
