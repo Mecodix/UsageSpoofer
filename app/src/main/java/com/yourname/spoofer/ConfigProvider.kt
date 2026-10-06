@@ -49,7 +49,25 @@ class ConfigProvider : ContentProvider() {
     }
 
     override fun getType(uri: Uri): String? = null
-    override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+
+    /**
+     * Log sink for the hooked process.
+     *
+     * LogWriter writes to `context.externalFilesDir`, which resolves against
+     * whichever app calls it. When the hook writes, that is the host app, whose
+     * external dir the module cannot read. Handling the write here pins the
+     * context to the module process, so LogViewerActivity can always read it.
+     */
+    override fun insert(uri: Uri, values: ContentValues?): Uri? {
+        val ownContext = context ?: return null
+        if (uri.pathSegments.firstOrNull() != "log") return null
+
+        val tag = values?.getAsString("tag") ?: "HOOK"
+        val message = values?.getAsString("message") ?: return null
+        LogWriter.log(ownContext, tag, message)
+        return uri
+    }
+
     override fun delete(uri: Uri, selection: String?, selectionArgs: Array<String>?): Int = 0
     override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<String>?): Int = 0
 }

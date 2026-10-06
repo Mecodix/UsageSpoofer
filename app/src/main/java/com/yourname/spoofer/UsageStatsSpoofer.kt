@@ -111,12 +111,21 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
 
     private fun buildConfig(): SessionConfig? {
         val target = getRemoteConfig("", "target_package_to_spoof").trim()
-        if (target.isEmpty()) return null
-        if (getRemoteConfig(target, "enabled") == "false") return null
+        if (target.isEmpty()) {
+            logError("no target package configured yet - save a config in the module UI")
+            return null
+        }
+        val enabled = getRemoteConfig(target, "enabled")
+        if (enabled == "false") {
+            logError("config disabled for $target")
+            return null
+        }
 
         // Mode defaults to SET when the UI has never written an explicit value.
         val mode = getRemoteConfig(target, "mode").trim().toIntOrNull() ?: MODE_SET
         val durationMs = getRemoteConfig(target, "time").trim().toLongOrNull() ?: 0L
+
+        log("config resolved: target=$target mode=$mode durationMs=$durationMs enabled=$enabled")
         return SessionConfig(target, mode, durationMs.coerceAtLeast(0L))
     }
 
@@ -265,20 +274,75 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
     // ---------------------------------------------------------------- logging
 
     private fun getContext(): Context? = try {
-        AndroidAppHelper.currentApplication()
+        appContext ?: AndroidAppHelper.currentApplication()
     } catch (t: Throwable) {
         null
     }
 
-    /** Success path: one structural line, no disk I/O on the hot path. */
+    /** Success path: one structural line, mirrored into the in-app viewer. */
     private fun log(message: String) {
         XposedBridge.log(message)
+        pushToModule("HOOK", message)
     }
 
-    /** Failure path: mirrored to the in-app log viewer. */
+    /** Failure path: same sink, tagged so failures stand out in the viewer. */
     private fun logError(message: String) {
         XposedBridge.log("[Telemetry-Test] ERROR: $message")
-        getContext()?.let { LogWriter.log(it, "ERROR", message) }
+        pushToModule("ERROR", message)
+    }
+
+    /**
+     * Forwards a line into the module's own log file via its ContentProvider.
+     *
+     * Writing via LogWriter directly would land in the *host* app's
+     * externalFilesDir, which the module's LogViewerActivity cannot read.
+     */
+    private fun pushToModule(tag: String, message: String) {
+        try {
+            val context = getContext() ?: return
+            val values = android.content.ContentValues().apply {
+                put("tag", tag)
+                put("message", message)
+            }
+            context.contentResolver.insert(
+                Uri.parse("content://$CONFIG_AUTHORITY/log"),
+                values
+            )
+        } catch (t: Throwable) {
+            // Logging must never propagate into the host process.
+            XposedBridge.log("[Telemetry-Test] log sink unavailable: ${t.message}")
+        }
+    }
+
+    /**
+     * Cached Application reference. handleLoadPackage runs before
+     * currentApplication() is populated, so an early log line would otherwise
+     * have nowhere to go.
+     */
+    @Volatile
+    private var appContext: Context? = null
+
+    private fun awaitApplication() {
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.app.Application",
+                "attach",
+                Context::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (appContext == null) {
+                            appContext = getContext()
+                            log(
+                                "[Telemetry-Test] host Application ready " +
+                                    "(pid=${android.os.Process.myPid()})"
+                            )
+                        }
+                    }
+                }
+            )
+        } catch (t: Throwable) {
+            logError("could not hook Application.attach: ${t.message}")
+        }
     }
 
     // ------------------------------------------------------------------ hooks
@@ -286,7 +350,11 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
         if (lpparam.packageName != HOST_APP) return
 
-        log("[Telemetry-Test] Validation module attached to $HOST_APP")
+        log("[Telemetry-Test] Validation module attached to $HOST_APP (pid=${android.os.Process.myPid()})")
+
+        // currentApplication() is often still null at this point in startup, so hook
+        // Application.attach to establish the context used by the log sink.
+        awaitApplication()
 
         try {
             val usageStatsManagerClass = XposedHelpers.findClass(
