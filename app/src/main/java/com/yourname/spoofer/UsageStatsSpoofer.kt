@@ -25,7 +25,9 @@ import java.lang.reflect.Constructor
 class UsageStatsSpoofer : IXposedHookLoadPackage {
 
     private companion object {
-        private const val HOST_APP = "com.example.telemetry.sandbox"
+        /** Our own package: never instrument ourselves. */
+        private const val MODULE_PACKAGE = "com.yourname.spoofer"
+
         private const val CONFIG_AUTHORITY = "com.yourname.spoofer.configprovider"
 
         /** Simulated session exits this far before the query window closes. */
@@ -322,7 +324,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
     @Volatile
     private var appContext: Context? = null
 
-    private fun awaitApplication(classLoader: ClassLoader) {
+    private fun awaitApplication(classLoader: ClassLoader, onReady: (Context) -> Unit) {
         try {
             XposedHelpers.findAndHookMethod(
                 "android.app.Application",
@@ -331,12 +333,17 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 Context::class.java,
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        if (appContext == null) {
-                            appContext = getContext()
-                            log(
-                                "[Telemetry-Test] host Application ready " +
-                                    "(pid=${android.os.Process.myPid()})"
-                            )
+                        if (appContext != null) return
+                        val ctx = getContext() ?: return
+                        appContext = ctx
+                        log(
+                            "[Telemetry-Test] host Application ready " +
+                                "(pid=${android.os.Process.myPid()})"
+                        )
+                        try {
+                            onReady(ctx)
+                        } catch (t: Throwable) {
+                            logError("hook installation failed: ${t.message}")
                         }
                     }
                 }
@@ -349,18 +356,39 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
     // ------------------------------------------------------------------ hooks
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
-        if (lpparam.packageName != HOST_APP) return
+        // Never instrument ourselves.
+        if (lpparam.packageName == MODULE_PACKAGE) return
 
-        log("[Telemetry-Test] Validation module attached to $HOST_APP (pid=${android.os.Process.myPid()})")
+        // No hardcoded host package. Which process gets instrumented is decided at
+        // runtime from the UI configuration, the same way LSPosed scope works.
+        // currentApplication() is still null here, so defer until Application.attach.
+        awaitApplication(lpparam.classLoader) { context ->
+            val target = getRemoteConfig("", "target_package_to_spoof").trim()
+            if (target.isEmpty()) {
+                logError(
+                    "no target package configured; open the module UI and save a config " +
+                        "(process ${lpparam.packageName} left uninstrumented)"
+                )
+                return@awaitApplication
+            }
+            if (target != lpparam.packageName) {
+                log("[Telemetry-Test] skipping ${lpparam.packageName}; configured target is $target")
+                return@awaitApplication
+            }
 
-        // currentApplication() is often still null at this point in startup, so hook
-        // Application.attach to establish the context used by the log sink.
-        awaitApplication(lpparam.classLoader)
+            log(
+                "[Telemetry-Test] Validation module attached to $target " +
+                    "(pid=${android.os.Process.myPid()})"
+            )
+            installUsageStatsHooks(lpparam.classLoader)
+        }
+    }
 
+    private fun installUsageStatsHooks(classLoader: ClassLoader) {
         try {
             val usageStatsManagerClass = XposedHelpers.findClass(
                 "android.app.usage.UsageStatsManager",
-                lpparam.classLoader
+                classLoader
             )
 
             XposedHelpers.findAndHookMethod(

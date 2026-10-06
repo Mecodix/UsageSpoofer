@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  LSPosed injects the module only into these packages. The hook itself does not
+  hardcode a host: it attaches to whichever package is saved in the module UI,
+  so this list only needs to cover the app you intend to profile.
+-->
 <resources>
     <string-array name="xposed_scope">
-        <item>com.example.telemetry.sandbox</item>
+        <item>com.rayole.cashromeo2</item>
     </string-array>
 </resources>
