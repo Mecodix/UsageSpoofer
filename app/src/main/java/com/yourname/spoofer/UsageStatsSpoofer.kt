@@ -12,6 +12,12 @@ import android.app.usage.UsageEvents
 
 class UsageStatsSpoofer : IXposedHookLoadPackage {
 
+    companion object {
+        // Shared session timestamps — both hooks read from this
+        @Volatile var sessionStart: Long = 0L
+        @Volatile var sessionEnd: Long = 0L
+    }
+
     // Helper method to safely query your UI app configuration across sandboxed processes
     private fun getRemoteConfig(packageNameKey: String, field: String): String {
         try {
@@ -134,9 +140,11 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                                 }
                             }
 
-                            // Calculate timestamps that are mathematically consistent with events
+                            // Calculate and STORE timestamps for both hooks to share
                             val sessionStart = queryBeginTime + 500L
                             val sessionEnd = (queryBeginTime + finalDurationMs).coerceAtMost(queryEndTime)
+                            UsageStatsSpoofer.sessionStart = sessionStart
+                            UsageStatsSpoofer.sessionEnd = sessionEnd
 
                             // Modify the summary analytics payload fields inside memory
                             XposedHelpers.setLongField(statsObj, "mTotalTimeInForeground", finalDurationMs)
@@ -228,8 +236,9 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                                         durationMs = maxAvailableWindow - 5000L
                                     }
 
-                                    val foregroundTime = queryBeginTime
-                                    val backgroundTime = (queryBeginTime + durationMs).coerceAtMost(queryEndTime)
+                                    // READ shared timestamps from summary hook — no separate calculation
+                                    val foregroundTime = UsageStatsSpoofer.sessionStart
+                                    val backgroundTime = UsageStatsSpoofer.sessionEnd
                                     val className = "$targetPkg.MainActivity"
 
                                     val injectedEvents = mutableListOf<Any>()
