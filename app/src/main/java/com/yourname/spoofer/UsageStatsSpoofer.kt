@@ -359,26 +359,24 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         // Never instrument ourselves.
         if (lpparam.packageName == MODULE_PACKAGE) return
 
-        // No hardcoded host package. Which process gets instrumented is decided at
-        // runtime from the UI configuration, the same way LSPosed scope works.
+        // Which process gets instrumented is decided by the LSPosed scope array, not
+        // by config. The configured package is the *subject* of the spoof, which is
+        // independent of the *reader* app doing the query.
+        //
         // currentApplication() is still null here, so defer until Application.attach.
-        awaitApplication(lpparam.classLoader) { context ->
-            val target = getRemoteConfig("", "target_package_to_spoof").trim()
-            if (target.isEmpty()) {
+        awaitApplication(lpparam.classLoader) {
+            val subject = getRemoteConfig("", "target_package_to_spoof").trim()
+            if (subject.isEmpty()) {
                 logError(
                     "no target package configured; open the module UI and save a config " +
-                        "(process ${lpparam.packageName} left uninstrumented)"
+                        "(process ${lpparam.packageName} instrumented but inactive)"
                 )
-                return@awaitApplication
-            }
-            if (target != lpparam.packageName) {
-                log("[Telemetry-Test] skipping ${lpparam.packageName}; configured target is $target")
                 return@awaitApplication
             }
 
             log(
-                "[Telemetry-Test] Validation module attached to $target " +
-                    "(pid=${android.os.Process.myPid()})"
+                "[Telemetry-Test] attached to reader app ${lpparam.packageName} " +
+                    "(pid=${android.os.Process.myPid()}), spoofing subject=$subject"
             )
             installUsageStatsHooks(lpparam.classLoader)
         }
@@ -409,7 +407,16 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
 
                             val targetEntry = resultList.firstOrNull { entry ->
                                 statsPackageName(entry) == config.targetPackage
-                            } ?: return
+                            } ?: run {
+                                // Almost always means the configured package has no
+                                // usage row in this window, or was misspelled.
+                                log(
+                                    "[Telemetry-Test] no usage row for subject " +
+                                        "${config.targetPackage} in this query " +
+                                        "(${resultList.size} rows returned)"
+                                )
+                                return
+                            }
 
                             if (config.mode == MODE_HIDE) {
                                 // Star projection: we only need mutation, and an explicit

@@ -24,9 +24,19 @@ class MainActivity : Activity() {
             setTextColor(Color.WHITE)
             setPadding(0, 0, 0, 40)
         }
+
+        // The package below is the app whose usage time is rewritten, which is not
+        // necessarily the app the hook runs in. That one is fixed by LSPosed scope.
+        val subtitle = TextView(this).apply {
+            text = "Enter the app whose usage time you want to change. " +
+                "The hook runs inside the monitoring app listed in LSPosed scope."
+            textSize = 12f
+            setTextColor(Color.GRAY)
+            setPadding(0, 0, 0, 24)
+        }
         
         val pkgInput = EditText(this).apply { 
-            hint = "App Package (e.g., com.google.android.youtube)"
+            hint = "App to spoof (e.g. com.google.android.youtube)"
             setTextColor(Color.WHITE)
             setHintTextColor(Color.GRAY)
         }
@@ -44,6 +54,11 @@ class MainActivity : Activity() {
         modeSpinner.adapter = adapter
         
         val prefs = getSharedPreferences("SpooferConfigPrivate", Context.MODE_PRIVATE)
+
+        // Show the previously saved values so the config is not silently blanked.
+        pkgInput.setText(prefs.getString("target_package_to_spoof", ""))
+        timeInput.setText(prefs.getLong("custom_spoof_minutes", 0L).toString())
+        modeSpinner.setSelection(prefs.getInt("spoof_mode", 0))
 
         // Enable/Disable toggle
         val toggleSwitch = Switch(this).apply {
@@ -66,6 +81,7 @@ class MainActivity : Activity() {
         }
 
         layout.addView(title)
+        layout.addView(subtitle)
         layout.addView(toggleSwitch)
         layout.addView(pkgInput)
         layout.addView(timeInput)
