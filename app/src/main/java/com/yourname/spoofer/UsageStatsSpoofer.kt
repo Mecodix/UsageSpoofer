@@ -544,161 +544,271 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         }
     }
 
+    /**
+     * Registers a hook across every overload family the reader might call.
+     *
+     * The tricky part is that begin/end sit at different argument positions:
+     *
+     *   queryUsageStats(interval, begin, end)                    begin at 1
+     *   queryAndAggregateUsageStats(begin, end)                   begin at 0
+     *   queryEvents(begin, end)                                  begin at 0
+     *   queryEventsForPackage(pkg, begin, end)                   begin at 1
+     *
+     * so each entry supplies its own begin index. Overloads absent on a given
+     * build are skipped silently - that is normal, not a failure.
+     */
     private fun installUsageStatsHooks(classLoader: ClassLoader) {
-        try {
-            val usageStatsManagerClass = XposedHelpers.findClass(
-                "android.app.usage.UsageStatsManager",
-                classLoader
-            )
+        val usageStatsManagerClass = try {
+            XposedHelpers.findClass("android.app.usage.UsageStatsManager", classLoader)
+        } catch (t: Throwable) {
+            logError("could not resolve UsageStatsManager: ${t.message}")
+            return
+        }
 
-            // Summary hook. Android 10+ apps increasingly call the AsUser variant,
-            // which takes a trailing userId. Hook both so a reader using either
-            // entry point is covered; the handler reads begin/end by position and
-            // tolerates the extra trailing argument.
-            val summaryHook = object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    try {
-                            if (param.args.size < 3) return
-                            val queryBeginTime = param.args[1] as? Long ?: return
-                            val queryEndTime = param.args[2] as? Long ?: return
+        val intClass = Int::class.javaPrimitiveType!!
+        val longClass = Long::class.javaPrimitiveType!!
+        val stringClass = String::class.java
 
-                            val config = resolveConfig() ?: return
-                            val resultList = param.result as? List<*> ?: return
+        // ---- summary: per-bucket rows and the merged map -------------------
 
-                            val targetEntry = resultList.firstOrNull { entry ->
-                                statsPackageName(entry) == config.targetPackage
-                            } ?: run {
-                                // Almost always means the configured package has no
-                                // usage row in this window, or was misspelled.
-                                log(
-                                    "[Telemetry-Test] no usage row for subject " +
-                                        "${config.targetPackage} in this query " +
-                                        "(${resultList.size} rows returned)"
-                                )
-                                return
-                            }
-
-                            if (config.mode == MODE_HIDE) {
-                                // Star projection: we only need mutation, and an explicit
-                                // type argument here would be an erased-type check.
-                                val mutableResult = resultList as? MutableList<Any?>
-                                if (mutableResult != null) {
-                                    if (!mutableResult.remove(targetEntry)) {
-                                        zeroOutStats(targetEntry)
-                                    }
-                                } else {
-                                    zeroOutStats(targetEntry)
-                                }
-                                return
-                            }
-
-                            val realForegroundMs =
-                                getLongField(targetEntry, "mTotalTimeInForeground")
-                            log(
-                                "[Telemetry-Test] summary match: real=" +
-                                    "${realForegroundMs}ms window=${queryEndTime - queryBeginTime}ms " +
-                                    "intervalType=${param.args[0]} mode=${config.mode} " +
-                                    "addMs=${config.targetDurationMs}"
-                            )
-
-                            val anchors = computeAnchors(
-                                queryBeginTime = queryBeginTime,
-                                queryEndTime = queryEndTime,
-                                targetDurationMs = config.targetDurationMs,
-                                realForegroundMs = realForegroundMs,
-                                mode = config.mode
-                            )
-
-                            // Track which fields fail so a partially-applied injection names the
-                            // culprit instead of reporting a bare boolean.
-                            val failed = mutableListOf<String>()
-
-                            fun writeLong(field: String, value: Long) {
-                                if (!setLongField(targetEntry, field, value)) {
-                                    failed.add(field)
-                                }
-                            }
-
-                            writeLong("mTotalTimeInForeground", anchors.durationMs)
-                            writeLong("mTotalTimeVisible", anchors.durationMs)
-                            writeLong("mBeginTimeStamp", anchors.queryBegin)
-                            writeLong("mEndTimeStamp", anchors.queryEnd)
-                            writeLong("mLastTimeUsed", anchors.sessionEnd)
-                            writeLong("mLastTimeVisible", anchors.sessionEnd)
-
-                            val nextLaunchCount = getIntField(targetEntry, "mAppLaunchCount") + 1
-                            if (!setIntField(targetEntry, "mAppLaunchCount", nextLaunchCount)) {
-                                failed.add("mAppLaunchCount")
-                            }
-
-                            if (failed.isEmpty()) {
-                                // Read the value back. XposedHelpers can report
-                                // success while ART has quietly discarded the write,
-                                // so verify rather than trust the setter.
-                                val verified = getLongField(targetEntry, "mTotalTimeInForeground")
-
-                                // A reader that computes its total from the
-                                // event timeline must see the same duration the
-                                // summary reports, so share the final value.
-                                lastInjectedDurationMs = anchors.durationMs
-
-                                log(
-                                    "[Telemetry-Test] SUMMARY injected for ${config.targetPackage} " +
-                                        "(wrote=${anchors.durationMs}ms readBack=${verified}ms " +
-                                        "real=${realForegroundMs}ms)"
-                                )
-                            } else {
-                                logError(
-                                    "summary injection failed for ${config.targetPackage}; " +
-                                        "unwritable fields: ${failed.joinToString(", ")} " +
-                                        "(exemption=${hiddenApiExemption})"
-                                )
-                            }
-                        } catch (t: Throwable) {
-                            logError("queryUsageStats hook failure: ${t.message}")
-                        }
-                    }
+        val summaryHook = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) = try {
+                applySummary(param.result, param.args, 1, "summary")
+            } catch (t: Throwable) {
+                logError("summary hook failure: ${t.message}")
             }
+        }
 
-            hookUsageStatsVariants(
-                usageStatsManagerClass,
-                "queryUsageStats",
-                arrayOf(
-                    Int::class.javaPrimitiveType!!,
-                    Long::class.javaPrimitiveType!!,
-                    Long::class.javaPrimitiveType!!
-                ),
-                summaryHook
-            )
+        // queryUsageStats returns one UsageStats per package per bucket.
+        register(
+            usageStatsManagerClass, summaryHook,
+            method = "queryUsageStats",
+            params = arrayOf(intClass, longClass, longClass),
+            beginIndex = 1
+        )
 
+        // queryAndAggregateUsageStats merges buckets and returns a
+        // Map<package, UsageStats>. A progress-bar reader usually calls this
+        // one, so it has to be covered or the summary fix is invisible.
+        val aggregateHook = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) = try {
+                applySummary(param.result, param.args, 0, "aggregate")
+            } catch (t: Throwable) {
+                logError("aggregate hook failure: ${t.message}")
+            }
+        }
 
-            hookUsageStatsVariants(
-                usageStatsManagerClass,
-                "queryEvents",
-                arrayOf(
-                    Long::class.javaPrimitiveType!!,
-                    Long::class.javaPrimitiveType!!
-                ),
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        try {
-                            if (param.args.size < 2) return
-                            val queryBeginTime = param.args[0] as? Long ?: return
-                            val queryEndTime = param.args[1] as? Long ?: return
+        register(
+            usageStatsManagerClass, aggregateHook,
+            method = "queryAndAggregateUsageStats",
+            params = arrayOf(longClass, longClass),
+            beginIndex = 0
+        )
 
-                            applyTimeline(param.result, queryBeginTime, queryEndTime)
-                        } catch (t: Throwable) {
-                            logError("queryEvents hook failure: ${t.message}")
-                        }
-                    }
-                }
+        // ---- timeline: raw events -----------------------------------------
+
+        val eventsHook = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) = try {
+                val begin = param.args.longAt(0)
+                val end = param.args.longAt(1)
+                if (begin == null || end == null) return
+                applyTimeline(param.result, begin, end)
+            } catch (t: Throwable) {
+                logError("queryEvents hook failure: ${t.message}")
+            }
+        }
+
+        register(
+            usageStatsManagerClass, eventsHook,
+            method = "queryEvents",
+            params = arrayOf(longClass, longClass),
+            beginIndex = 0
+        )
+
+        // queryEventsForPackage takes the package first.
+        val eventsForPackageHook = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) = try {
+                val begin = param.args.longAt(1)
+                val end = param.args.longAt(2)
+                if (begin == null || end == null) return
+                applyTimeline(param.result, begin, end)
+            } catch (t: Throwable) {
+                logError("queryEventsForPackage hook failure: ${t.message}")
+            }
+        }
+
+        register(
+            usageStatsManagerClass, eventsForPackageHook,
+            method = "queryEventsForPackage",
+            params = arrayOf(stringClass, longClass, longClass),
+            beginIndex = 1
+        )
+
+        // ---- health probe: report which entry points actually exist ---------
+
+        reportCoverage(usageStatsManagerClass)
+    }
+
+    /** Hooks [method] plus its trailing-userId overload when present. */
+    private fun register(
+        usageStatsManagerClass: Class<*>,
+        callback: XC_MethodHook,
+        method: String,
+        params: Array<Class<*>>,
+        beginIndex: Int
+    ) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                usageStatsManagerClass, method, *params, callback
             )
         } catch (t: Throwable) {
-            logError("critical initialization failure: ${t.message}")
+            XposedBridge.log("[Telemetry-Test] hook $method failed: ${t.message}")
+        }
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                usageStatsManagerClass, "${method}AsUser",
+                *params, Int::class.javaPrimitiveType!!, callback
+            )
+        } catch (t: Throwable) {
+            XposedBridge.log("[Telemetry-Test] ${method}AsUser absent, skipped")
         }
     }
 
-    /** Timeline mutation, shared by queryEvents and queryEventsAsUser. */
+    /**
+     * Logs which query entry points exist on this build.
+     *
+     * A reader that keeps showing real data is almost always calling an entry
+     * point we did not recognise, so make the surface visible rather than
+     * guessing which one is in use.
+     */
+    private fun reportCoverage(usageStatsManagerClass: Class<*>) {
+        val watched = listOf(
+            "queryUsageStats", "queryUsageStatsAsUser",
+            "queryAndAggregateUsageStats", "queryAndAggregateUsageStatsAsUser",
+            "queryEvents", "queryEventsAsUser",
+            "queryEventsForPackage", "queryEventsForPackageForUser",
+            "queryEventsForUser"
+        )
+        val present = mutableListOf<String>()
+        val missing = mutableListOf<String>()
+        for (name in watched) {
+            val found = try {
+                usageStatsManagerClass.declaredMethods.any { it.name == name }
+            } catch (t: Throwable) {
+                false
+            }
+            if (found) present.add(name) else missing.add(name)
+        }
+        log("[Telemetry-Test] query surface present: ${present.joinToString(",")}")
+        log("[Telemetry-Test] query surface absent: ${missing.joinToString(",")}")
+    }
+
+    private fun Array<Any?>.longAt(index: Int): Long? =
+        if (index < size) getOrNull(index) as? Long else null
+
+    /**
+     * Applies the summary injection to either return shape:
+     *
+     *   queryUsageStats             -> List<UsageStats>, found by mPackageName
+     *   queryAndAggregateUsageStats -> Map<String, UsageStats>, keyed by package
+     */
+    private fun applySummary(
+        result: Any?,
+        args: Array<Any?>,
+        beginIndex: Int,
+        kind: String
+    ) {
+        val queryBeginTime = args.longAt(beginIndex) ?: return
+        val queryEndTime = args.longAt(beginIndex + 1) ?: return
+
+        val config = resolveConfig() ?: return
+
+        val targetEntry: Any? = when (result) {
+            is List<*> -> {
+                val found = result.firstOrNull { statsPackageName(it) == config.targetPackage }
+                if (found == null) {
+                    log(
+                        "[Telemetry-Test] $kind: no row for ${config.targetPackage} " +
+                            "(${result.size} rows)"
+                    )
+                }
+                found
+            }
+            is Map<*, *> -> {
+                val found = result[config.targetPackage]
+                    ?: result.entries.firstOrNull {
+                        statsPackageName(it.value) == config.targetPackage
+                    }?.value
+                if (found == null) {
+                    log(
+                        "[Telemetry-Test] $kind: no entry for ${config.targetPackage} " +
+                            "(${result.size} keys)"
+                    )
+                }
+                found
+            }
+            else -> return
+        } ?: return
+
+        if (config.mode == MODE_HIDE) {
+            // Remove the row when the container is mutable, otherwise blank it.
+            var removed = false
+            if (result is MutableList<*>) removed = result.remove(targetEntry)
+            if (result is MutableMap<*, *>) removed = result.remove(config.targetPackage)
+            if (!removed) zeroOutStats(targetEntry)
+            log("[Telemetry-Test] $kind HIDDEN ${config.targetPackage} removed=$removed")
+            return
+        }
+
+        val realForegroundMs = getLongField(targetEntry, "mTotalTimeInForeground")
+        val anchors = computeAnchors(
+            queryBeginTime = queryBeginTime,
+            queryEndTime = queryEndTime,
+            targetDurationMs = config.targetDurationMs,
+            realForegroundMs = realForegroundMs,
+            mode = config.mode
+        )
+
+        val failed = mutableListOf<String>()
+        fun writeLong(field: String, value: Long) {
+            if (!setLongField(targetEntry, field, value)) failed.add(field)
+        }
+
+        writeLong("mTotalTimeInForeground", anchors.durationMs)
+        writeLong("mTotalTimeVisible", anchors.durationMs)
+        writeLong("mBeginTimeStamp", anchors.queryBegin)
+        writeLong("mEndTimeStamp", anchors.queryEnd)
+        writeLong("mLastTimeUsed", anchors.sessionEnd)
+        writeLong("mLastTimeVisible", anchors.sessionEnd)
+
+        val nextLaunchCount = getIntField(targetEntry, "mAppLaunchCount") + 1
+        if (!setIntField(targetEntry, "mAppLaunchCount", nextLaunchCount)) {
+            failed.add("mAppLaunchCount")
+        }
+
+        if (failed.isNotEmpty()) {
+            logError(
+                "$kind injection failed for ${config.targetPackage}; " +
+                    "unwritable: ${failed.joinToString(",")} " +
+                    "exemption=${hiddenApiExemption}"
+            )
+            return
+        }
+
+        // Share the final value so a reader deriving its total from the event
+        // timeline reports the same duration the summary shows.
+        lastInjectedDurationMs = anchors.durationMs
+
+        val verified = getLongField(targetEntry, "mTotalTimeInForeground")
+        log(
+            "[Telemetry-Test] $kind injected ${config.targetPackage} " +
+                "real=${realForegroundMs}ms wrote=${anchors.durationMs}ms " +
+                "readBack=${verified}ms window=${queryEndTime - queryBeginTime}ms"
+        )
+    }
+
+    /** Timeline mutation, shared by every events entry point. */
     private fun applyTimeline(result: Any?, queryBeginTime: Long, queryEndTime: Long) {
         try {
             val config = resolveConfig() ?: return
@@ -711,20 +821,15 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                     eventPackage(it) == config.targetPackage
                 }
                 log(
-                    "[Telemetry-Test] Synchronized session timeline " +
-                        "injected successfully for ${config.targetPackage} " +
-                        "(hidden, $removed events removed)"
+                    "[Telemetry-Test] TIMELINE HIDDEN ${config.targetPackage} " +
+                        "($removed events removed)"
                 )
                 return
             }
 
-            // Identical anchor math to the summary hook.
-            //
-            // Events carry no duration field, so ADD mode cannot read a real
-            // foreground total here. Reuse the final value the summary hook
-            // already computed (real + added, capped) so a reader summing
-            // foreground spans agrees with the summary row. Fall back to the
-            // configured amount before any summary query has run.
+            // Events carry no duration, so reuse the value the summary already
+            // computed (real + added, capped) and fall back to the configured
+            // amount before any summary query has run.
             val timelineDurationMs = lastInjectedDurationMs ?: config.targetDurationMs
             val anchors = computeAnchors(
                 queryBeginTime = queryBeginTime,
@@ -734,7 +839,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 mode = MODE_SET
             )
 
-            // Drop the package's real triggers so nothing collides.
             val removedCount =
                 container.removeAll { eventPackage(it) == config.targetPackage }
 
@@ -770,8 +874,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                     lastInteraction
                 )?.let(injected::add)
             } else {
-                // Session shorter than 2 * offset: one midpoint
-                // interaction keeps the lifecycle well-formed.
                 buildEvent(
                     EVENT_USER_INTERACTION,
                     config.targetPackage,
@@ -782,66 +884,21 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
             }
 
             if (injected.isEmpty()) {
-                logError(
-                    "no synthetic events could be built for " +
-                        config.targetPackage
-                )
+                logError("no synthetic events built for ${config.targetPackage}")
                 return
             }
 
             container.addAll(injected)
-            // The sandbox engine parses a chronological timeline.
             container.sortBy { eventTimestamp(it) }
 
-            // A progress-bar UI typically derives its fill from
-            // these events, so report the shape we produced.
             log(
-                "[Telemetry-Test] TIMELINE injected for " +
-                    "${config.targetPackage}: removed=${removedCount} " +
-                    "injected=${injected.size} total=${container.size} " +
-                    "window=${anchors.sessionEnd - anchors.sessionStart}ms " +
-                    "events=${injected.map { eventTimestamp(it) - anchors.sessionStart }}"
+                "[Telemetry-Test] TIMELINE injected ${config.targetPackage} " +
+                    "removed=$removedCount injected=${injected.size} " +
+                    "total=${container.size} " +
+                    "span=${anchors.sessionEnd - anchors.sessionStart}ms"
             )
         } catch (t: Throwable) {
             logError("queryEvents hook failure: ${t.message}")
-        }
-    }
-
-    /**
-     * Hooks both the plain method and its trailing-userId AsUser variant.
-     *
-     * Apps on Android 10+ increasingly call queryUsageStatsAsUser /
-     * queryEventsAsUser, so hooking only the plain name leaves those readers
-     * untouched. The variant may be absent on some builds, which is not fatal.
-     */
-    private fun hookUsageStatsVariants(
-        usageStatsManagerClass: Class<*>,
-        methodName: String,
-        leadingParams: Array<Class<*>>,
-        callback: XC_MethodHook
-    ) {
-        try {
-            XposedHelpers.findAndHookMethod(
-                usageStatsManagerClass,
-                methodName,
-                *leadingParams,
-                callback
-            )
-        } catch (t: Throwable) {
-            logError("could not hook $methodName: ${t.message}")
-        }
-
-        try {
-            XposedHelpers.findAndHookMethod(
-                usageStatsManagerClass,
-                "${methodName}AsUser",
-                *leadingParams,
-                Int::class.javaPrimitiveType!!,
-                callback
-            )
-        } catch (t: Throwable) {
-            // Very common: not every build exposes the AsUser overload.
-            XposedBridge.log("[Telemetry-Test] ${methodName}AsUser not present, skipped")
         }
     }
 
