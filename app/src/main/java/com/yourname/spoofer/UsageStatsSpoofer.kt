@@ -315,9 +315,13 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                             } ?: return
 
                             if (config.mode == MODE_HIDE) {
-                                if (resultList is MutableList<Any?>) {
-                                    val removed = resultList.remove(targetEntry)
-                                    if (!removed) zeroOutStats(targetEntry)
+                                // Star projection: we only need mutation, and an explicit
+                                // type argument here would be an erased-type check.
+                                val mutableResult = resultList as? MutableList<Any?>
+                                if (mutableResult != null) {
+                                    if (!mutableResult.remove(targetEntry)) {
+                                        zeroOutStats(targetEntry)
+                                    }
                                 } else {
                                     zeroOutStats(targetEntry)
                                 }
