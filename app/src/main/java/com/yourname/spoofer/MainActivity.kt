@@ -57,12 +57,21 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.parseColor("#BB86FC"))
         }
 
+        val logBtn = Button(this).apply {
+            text = "VIEW LOGS"
+            setBackgroundColor(Color.parseColor("#03DAC5"))
+            setOnClickListener {
+                startActivity(android.content.Intent(this@MainActivity, LogViewerActivity::class.java))
+            }
+        }
+
         layout.addView(title)
         layout.addView(toggleSwitch)
         layout.addView(pkgInput)
         layout.addView(timeInput)
         layout.addView(modeSpinner)
         layout.addView(saveBtn)
+        layout.addView(logBtn)
         setContentView(layout)
 
         saveBtn.setOnClickListener {

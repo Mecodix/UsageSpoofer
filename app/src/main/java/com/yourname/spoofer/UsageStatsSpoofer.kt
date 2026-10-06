@@ -152,15 +152,20 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                             XposedHelpers.setIntField(statsObj, "mAppLaunchCount", currentLaunchCount + 1)
 
                             // Log all hidden fields for audit (compare real vs spoof sessions)
-                            XposedBridge.log("[GodMode] === FIELD AUDIT for $pkgName ===")
-                            XposedBridge.log("[GodMode] mPackageName: $pkgName")
-                            XposedBridge.log("[GodMode] mTotalTimeInForeground: ${XposedHelpers.getLongField(statsObj, "mTotalTimeInForeground")}")
-                            XposedBridge.log("[GodMode] mLastTimeUsed: ${XposedHelpers.getLongField(statsObj, "mLastTimeUsed")}")
-                            XposedBridge.log("[GodMode] mLastTimeVisible: ${XposedHelpers.getLongField(statsObj, "mLastTimeVisible")}")
-                            XposedBridge.log("[GodMode] mAppLaunchCount: ${XposedHelpers.getIntField(statsObj, "mAppLaunchCount")}")
-                            XposedBridge.log("[GodMode] mBeginTimeStamp: ${XposedHelpers.getLongField(statsObj, "mBeginTimeStamp")}")
-                            XposedBridge.log("[GodMode] mEndTimeStamp: ${XposedHelpers.getLongField(statsObj, "mEndTimeStamp")}")
-                            XposedBridge.log("[GodMode] Successfully applied mode $mode to summary statistics for: $pkgName")
+                            val logMsg = buildString {
+                                appendLine("=== FIELD AUDIT for $pkgName ===")
+                                appendLine("mPackageName: $pkgName")
+                                appendLine("mTotalTimeInForeground: ${XposedHelpers.getLongField(statsObj, "mTotalTimeInForeground")}")
+                                appendLine("mLastTimeUsed: ${XposedHelpers.getLongField(statsObj, "mLastTimeUsed")}")
+                                appendLine("mLastTimeVisible: ${XposedHelpers.getLongField(statsObj, "mLastTimeVisible")}")
+                                appendLine("mAppLaunchCount: ${XposedHelpers.getIntField(statsObj, "mAppLaunchCount")}")
+                                appendLine("mBeginTimeStamp: ${XposedHelpers.getLongField(statsObj, "mBeginTimeStamp")}")
+                                appendLine("mEndTimeStamp: ${XposedHelpers.getLongField(statsObj, "mEndTimeStamp")}")
+                                appendLine("Successfully applied mode $mode to summary statistics for: $pkgName")
+                            }
+                            XposedBridge.log(logMsg)
+                            val ctx = AndroidAppHelper.currentApplication()
+                            if (ctx != null) LogWriter.log(ctx, "SUMMARY", logMsg)
                         }
                     }
                 }
@@ -287,14 +292,19 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                                     eventContainer.addAll(injectedEvents)
 
                                     // Timeline audit log
-                                    XposedBridge.log("[GodMode] === TIMELINE AUDIT for $targetPkg ===")
-                                    for ((index, event) in injectedEvents.withIndex()) {
-                                        val pkg = XposedHelpers.getObjectField(event, "mPackage") as? String ?: "?"
-                                        val ts = XposedHelpers.getLongField(event, "mTimeStamp")
-                                        val type = XposedHelpers.getIntField(event, "mEventType")
-                                        XposedBridge.log("[GodMode] Event[$index]: pkg=$pkg, type=$type, timestamp=$ts")
+                                    val timelineLog = buildString {
+                                        appendLine("=== TIMELINE AUDIT for $targetPkg ===")
+                                        for ((index, event) in injectedEvents.withIndex()) {
+                                            val pkg = XposedHelpers.getObjectField(event, "mPackage") as? String ?: "?"
+                                            val ts = XposedHelpers.getLongField(event, "mTimeStamp")
+                                            val type = XposedHelpers.getIntField(event, "mEventType")
+                                            appendLine("Event[$index]: pkg=$pkg, type=$type, timestamp=$ts")
+                                        }
+                                        appendLine("Injected ${injectedEvents.size} events for $targetPkg (${durationMs}ms)")
                                     }
-                                    XposedBridge.log("[GodMode] Injected ${injectedEvents.size} events for $targetPkg (${durationMs}ms)")
+                                    XposedBridge.log(timelineLog)
+                                    val ctx = AndroidAppHelper.currentApplication()
+                                    if (ctx != null) LogWriter.log(ctx, "TIMELINE", timelineLog)
                                 }
                             }
                         } catch (e: Exception) {

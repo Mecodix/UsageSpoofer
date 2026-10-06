@@ -14,6 +14,9 @@
             </intent-filter>
         </activity>
 
+        <!-- Log Viewer -->
+        <activity android:name=".LogViewerActivity" android:exported="false" />
+
         <!-- The Security Bridge: This allows the hook to safely fetch your UI settings -->
         <!-- Replace "com.yourname.spoofer" with your actual project package name if different -->
         <provider
