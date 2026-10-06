@@ -334,7 +334,19 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         if (appContext != null) return
-                        val ctx = getContext() ?: return
+
+                        // attach(Context) hands us the context directly. Reading it
+                        // from currentApplication() here always returns null, because
+                        // attach runs before the Application is registered - which
+                        // silently skipped every process before.
+                        val ctx = (param.args?.getOrNull(0) as? Context)
+                            ?: AndroidAppHelper.currentApplication()
+                        if (ctx == null) {
+                            XposedBridge.log(
+                                "[Telemetry-Test] no context available at attach; skipping"
+                            )
+                            return
+                        }
                         appContext = ctx
                         log(
                             "[Telemetry-Test] host Application ready " +

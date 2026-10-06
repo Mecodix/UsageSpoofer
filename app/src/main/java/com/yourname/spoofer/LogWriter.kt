@@ -10,8 +10,16 @@ object LogWriter {
     private const val LOG_FILE = "spoofer_logs.txt"
     private const val MAX_LOG_SIZE = 500 * 1024 // 500KB max
 
+    /**
+     * Shared log location.
+     *
+     * Writes arrive from the hooked process via ConfigProvider, so the context
+     * here is always the module's own. Reading externalFilesDir is unreliable
+     * early in startup and its path differs per device/user, so fall back to
+     * internal storage, which is always present and always readable by the
+     * module's own activities.
+     */
     private fun getLogFile(context: Context): File {
-        // Use external storage so both module and tracker processes can access
         val dir = context.getExternalFilesDir(null) ?: context.filesDir
         return File(dir, LOG_FILE)
     }
