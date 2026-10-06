@@ -22,7 +22,8 @@
         <provider
             android:name=".ConfigProvider"
             android:authorities="com.yourname.spoofer.configprovider"
-            android:exported="true" />
+            android:exported="true"
+            android:grantUriPermissions="true" />
 
     </application>
 </manifest>

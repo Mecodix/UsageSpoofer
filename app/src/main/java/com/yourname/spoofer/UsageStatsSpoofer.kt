@@ -203,21 +203,51 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
 
     // ------------------------------------------------------ UsageEvents access
 
-    /** Lazily resolved, hidden-API constructor for UsageEvents.Event. */
+    /**
+     * Lazily resolved hidden-API constructor for UsageEvents.Event.
+     *
+     * Two signatures exist across releases. Android 10+ added a trailing
+     * `count` int to some builds, so try the four-arg form first and fall back.
+     * Requires enableHiddenApiAccess() to have already granted an exemption on
+     * API 28+, otherwise every attempt throws NoSuchMethodException.
+     */
     private val eventConstructor: Constructor<*>? by lazy {
-        try {
+        val eventClass = try {
             Class.forName("android.app.usage.UsageEvents\$Event")
-                .getDeclaredConstructor(
-                    Int::class.javaPrimitiveType,
-                    String::class.java,
-                    String::class.java,
-                    Long::class.javaPrimitiveType
-                )
-                .apply { isAccessible = true }
         } catch (t: Throwable) {
-            logError("UsageEvents.Event constructor unavailable: ${t.message}")
-            null
+            logError("UsageEvents.Event class unavailable: ${t.message}")
+            return@lazy null
         }
+
+        val candidates = listOf(
+            arrayOf<Any>(
+                Int::class.javaPrimitiveType!!,
+                String::class.java,
+                String::class.java,
+                Long::class.javaPrimitiveType!!
+            ),
+            arrayOf<Any>(
+                Int::class.javaPrimitiveType!!,
+                String::class.java,
+                String::class.java,
+                Long::class.javaPrimitiveType!!,
+                Int::class.javaPrimitiveType!!
+            )
+        )
+
+        var lastError: Throwable? = null
+        for (signature in candidates) {
+            try {
+                val ctor = eventClass.getDeclaredConstructor(*signature)
+                ctor.isAccessible = true
+                return@lazy ctor
+            } catch (t: Throwable) {
+                lastError = t
+            }
+        }
+
+        logError("UsageEvents.Event constructor unavailable: ${lastError?.message}")
+        null
     }
 
     /**
@@ -248,7 +278,13 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
     ): Any? {
         val ctor = eventConstructor ?: return null
         return try {
-            ctor.newInstance(eventType, packageName, className, timestamp)
+            // Supply a trailing count for the 5-arg overload seen on newer
+            // builds; the 4-arg form ignores it.
+            if (ctor.parameterTypes.size == 5) {
+                ctor.newInstance(eventType, packageName, className, timestamp, 1)
+            } else {
+                ctor.newInstance(eventType, packageName, className, timestamp)
+            }
         } catch (t: Throwable) {
             logError("event synthesis failed (type=$eventType): ${t.message}")
             null
@@ -365,11 +401,85 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         }
     }
 
+    // ------------------------------------------------------- hidden API access
+
+    /**
+     * Which exemption route succeeded, or "none". Recorded so failures can be
+     * reported with their likely cause instead of a bare boolean.
+     */
+    @Volatile
+    private var hiddenApiExemption: String? = null
+
+    /**
+     * Grants this process a hidden API exemption before any framework reflection
+     * is attempted.
+     *
+     * Android 9+ blocks non-SDK access, and Android 15 (API 35) tightened the
+     * lists further. Without an exemption, `UsageEvents$Event`'s constructor and
+     * the private `mTotalTimeInForeground`-style fields throw
+     * NoSuchMethodException / NoSuchFieldException and the hooks silently degrade.
+     *
+     * Both entry points below are themselves blocked in the AOSP flags, so this
+     * tries several routes and reports which (if any) succeeded. "L" is the
+     * universal prefix-match token and exempts every class.
+     *
+     * Must be called before touching any non-SDK member: access flags are cached
+     * once a member is first resolved, and an exemption applied afterwards does
+     * not retroactively unlock it.
+     */
+    private fun enableHiddenApiAccess(): String {
+        // Route 1: ActivityThread.setHiddenApiExemptions - the route Xposed
+        // modules have traditionally used, and the one LSPosed leaves reachable.
+        try {
+            val activityThread = Class.forName("android.app.ActivityThread")
+            val current = activityThread
+                .getDeclaredMethod("currentActivityThread")
+                .apply { isAccessible = true }
+                .invoke(null)
+
+            activityThread
+                .getDeclaredMethod("setHiddenApiExemptions", Array<String>::class.java)
+                .apply { isAccessible = true }
+                .invoke(current, arrayOf("L"))
+
+            return "ActivityThread"
+        } catch (t: Throwable) {
+            // Fall through to VMRuntime.
+        }
+
+        // Route 2: dalvik.system.VMRuntime.setHiddenApiExemptions.
+        try {
+            val vmRuntime = Class.forName("dalvik.system.VMRuntime")
+            val runtime = vmRuntime
+                .getDeclaredMethod("getRuntime")
+                .apply { isAccessible = true }
+                .invoke(null)
+
+            vmRuntime
+                .getDeclaredMethod("setHiddenApiExemptions", Array<String>::class.java)
+                .apply { isAccessible = true }
+                .invoke(runtime, arrayOf("L"))
+
+            return "VMRuntime"
+        } catch (t: Throwable) {
+            // Fall through to reporting failure.
+        }
+
+        return "none"
+    }
+
     // ------------------------------------------------------------------ hooks
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
         // Never instrument ourselves.
         if (lpparam.packageName == MODULE_PACKAGE) return
+
+        // Claim the exemption first. On API 35 this is what makes the private
+        // UsageStats/UsageEvents members reachable at all.
+        if (hiddenApiExemption == null) {
+            hiddenApiExemption = enableHiddenApiAccess()
+            log("[Telemetry-Test] hidden API exemption route: $hiddenApiExemption")
+        }
 
         // Which process gets instrumented is decided by the LSPosed scope array, not
         // by config. The configured package is the *subject* of the spoof, which is
@@ -455,40 +565,38 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                                 mode = config.mode
                             )
 
-                            var allWritesOk = true
-                            allWritesOk = setLongField(
-                                targetEntry, "mTotalTimeInForeground", anchors.durationMs
-                            ) && allWritesOk
-                            allWritesOk = setLongField(
-                                targetEntry, "mTotalTimeVisible", anchors.durationMs
-                            ) && allWritesOk
-                            allWritesOk = setLongField(
-                                targetEntry, "mBeginTimeStamp", anchors.queryBegin
-                            ) && allWritesOk
-                            allWritesOk = setLongField(
-                                targetEntry, "mEndTimeStamp", anchors.queryEnd
-                            ) && allWritesOk
-                            allWritesOk = setLongField(
-                                targetEntry, "mLastTimeUsed", anchors.sessionEnd
-                            ) && allWritesOk
-                            allWritesOk = setLongField(
-                                targetEntry, "mLastTimeVisible", anchors.sessionEnd
-                            ) && allWritesOk
+                            // Track which fields fail so a partially-applied injection names the
+                            // culprit instead of reporting a bare boolean.
+                            val failed = mutableListOf<String>()
+
+                            fun writeLong(field: String, value: Long) {
+                                if (!setLongField(targetEntry, field, value)) {
+                                    failed.add(field)
+                                }
+                            }
+
+                            writeLong("mTotalTimeInForeground", anchors.durationMs)
+                            writeLong("mTotalTimeVisible", anchors.durationMs)
+                            writeLong("mBeginTimeStamp", anchors.queryBegin)
+                            writeLong("mEndTimeStamp", anchors.queryEnd)
+                            writeLong("mLastTimeUsed", anchors.sessionEnd)
+                            writeLong("mLastTimeVisible", anchors.sessionEnd)
 
                             val nextLaunchCount = getIntField(targetEntry, "mAppLaunchCount") + 1
-                            allWritesOk = setIntField(
-                                targetEntry, "mAppLaunchCount", nextLaunchCount
-                            ) && allWritesOk
+                            if (!setIntField(targetEntry, "mAppLaunchCount", nextLaunchCount)) {
+                                failed.add("mAppLaunchCount")
+                            }
 
-                            if (allWritesOk) {
+                            if (failed.isEmpty()) {
                                 log(
                                     "[Telemetry-Test] Synchronized session timeline " +
                                         "injected successfully for ${config.targetPackage}"
                                 )
                             } else {
                                 logError(
-                                    "summary injection partially failed for " +
-                                        config.targetPackage
+                                    "summary injection failed for ${config.targetPackage}; " +
+                                        "unwritable fields: ${failed.joinToString(", ")} " +
+                                        "(exemption=${hiddenApiExemption})"
                                 )
                             }
                         } catch (t: Throwable) {
