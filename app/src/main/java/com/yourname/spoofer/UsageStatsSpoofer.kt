@@ -147,8 +147,9 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                             XposedHelpers.setLongField(statsObj, "mLastTimeUsed", sessionEnd - 2000L)
                             XposedHelpers.setLongField(statsObj, "mLastTimeVisible", sessionEnd - 2000L)
 
-                            // Set launch count to 1 (one foreground session)
-                            XposedHelpers.setIntField(statsObj, "mAppLaunchCount", 1)
+                            // Increment launch count by 1 (progressive tracking)
+                            val currentLaunchCount = XposedHelpers.getIntField(statsObj, "mAppLaunchCount")
+                            XposedHelpers.setIntField(statsObj, "mAppLaunchCount", currentLaunchCount + 1)
 
                             // Log all hidden fields for audit (compare real vs spoof sessions)
                             XposedBridge.log("[GodMode] === FIELD AUDIT for $pkgName ===")
