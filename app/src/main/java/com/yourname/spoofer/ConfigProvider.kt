@@ -13,13 +13,38 @@ class ConfigProvider : ContentProvider() {
 
     override fun query(uri: Uri, projection: Array<String>?, selection: String?, selectionArgs: Array<String>?, sortOrder: String?): Cursor? {
         val prefs = context?.getSharedPreferences("SpooferConfigPrivate", Context.MODE_PRIVATE) ?: return null
-        
+
         // Build a temporary row structure to securely transmit settings variables across processes
         val cursor = MatrixCursor(arrayOf("key", "value"))
-        cursor.addRow(arrayOf("target_package_to_spoof", prefs.getString("target_package_to_spoof", "")))
-        cursor.addRow(arrayOf("custom_spoof_minutes", prefs.getLong("custom_spoof_minutes", 0L).toString()))
-        cursor.addRow(arrayOf("spoof_mode", prefs.getInt("spoof_mode", 0).toString()))
-        cursor.addRow(arrayOf("spoofer_enabled", prefs.getBoolean("spoofer_enabled", true).toString()))
+
+        val target = prefs.getString("target_package_to_spoof", "").orEmpty()
+        val mode = prefs.getInt("spoof_mode", 0)
+        val enabled = prefs.getBoolean("spoofer_enabled", true)
+
+        // "time" is transmitted in milliseconds; the UI still stores minutes.
+        val timeMs = prefs.getLong("custom_spoof_minutes", 0L) * 60_000L
+
+        val requestedPackage = uri.pathSegments.firstOrNull().orEmpty()
+
+        when {
+            // Global row set: lets the hook discover the selected target package.
+            requestedPackage.isEmpty() -> {
+                cursor.addRow(arrayOf("target_package_to_spoof", target))
+                cursor.addRow(arrayOf("time", timeMs.toString()))
+                cursor.addRow(arrayOf("mode", mode.toString()))
+                cursor.addRow(arrayOf("enabled", enabled.toString()))
+            }
+
+            // Package-scoped row set. No rows means "not configured for this package".
+            requestedPackage == target && target.isNotEmpty() -> {
+                cursor.addRow(arrayOf("time", timeMs.toString()))
+                cursor.addRow(arrayOf("mode", mode.toString()))
+                cursor.addRow(arrayOf("enabled", enabled.toString()))
+            }
+
+            else -> Unit // intentionally empty
+        }
+
         return cursor
     }
 

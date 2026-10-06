@@ -1,81 +1,292 @@
 package com.yourname.spoofer
 
+import android.app.AndroidAppHelper
+import android.app.usage.UsageEvents
+import android.content.Context
+import android.net.Uri
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
-import android.app.AndroidAppHelper
-import android.app.usage.UsageEvents
-import android.app.usage.UsageStats
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import java.lang.reflect.Constructor
 
+/**
+ * Dynamic validation module for the "OpenTelemetry Sandbox Engine"
+ * (com.example.telemetry.sandbox).
+ *
+ * Both hooks share one anchor-based baseline so the summary row and the event
+ * timeline always agree, independent of absolute wall-clock time. All timing is
+ * derived from the caller-supplied query window:
+ *
+ *   sessionEnd   = queryEnd   - TAIL_ANCHOR_MS
+ *   sessionStart = sessionEnd - finalDurationMs   (clamped to >= queryBegin)
+ */
 class UsageStatsSpoofer : IXposedHookLoadPackage {
 
-    private val hostApp = "com.rayole.cashromeo2"
-    private val dateFormat = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.getDefault())
+    private companion object {
+        private const val HOST_APP = "com.example.telemetry.sandbox"
+        private const val CONFIG_AUTHORITY = "com.yourname.spoofer.configprovider"
 
-    private fun formatTimestamp(epochMs: Long): String {
-        return "${dateFormat.format(Date(epochMs))} ($epochMs)"
+        /** Simulated session exits this far before the query window closes. */
+        private const val TAIL_ANCHOR_MS = 3000L
+
+        /** Headroom kept inside the window when a requested duration overruns it. */
+        private const val WINDOW_HEADROOM_MS = 5000L
+
+        /** Interaction events are offset this far from each session boundary. */
+        private const val INTERACTION_OFFSET_MS = 5000L
+
+        /** Config is cached briefly to avoid three binder round-trips per query. */
+        private const val CONFIG_CACHE_MS = 1500L
+
+        private const val MODE_SET = 0
+        private const val MODE_ADD = 1
+        private const val MODE_HIDE = 2
+
+        private const val EVENT_MOVE_TO_FOREGROUND = 1
+        private const val EVENT_MOVE_TO_BACKGROUND = 2
+        private const val EVENT_USER_INTERACTION = 7
+
+        private const val FIELD_PACKAGE = "mPackage"
+        private const val FIELD_EVENT_TYPE = "mEventType"
+        private const val FIELD_TIMESTAMP = "mTimeStamp"
     }
 
-    private fun getContext() = AndroidAppHelper.currentApplication()
+    // ------------------------------------------------------------------ config
 
-    private fun log(tag: String, message: String) {
-        XposedBridge.log("[Telemetry] $message")
-        getContext()?.let { LogWriter.log(it, tag, message) }
+    private class SessionConfig(
+        val targetPackage: String,
+        val mode: Int,
+        val targetDurationMs: Long
+    )
+
+    private class Anchors(
+        val queryBegin: Long,
+        val queryEnd: Long,
+        val sessionStart: Long,
+        val sessionEnd: Long,
+        val durationMs: Long
+    )
+
+    private val configLock = Any()
+    private var cachedConfig: SessionConfig? = null
+    private var cachedConfigAt = 0L
+
+    /**
+     * Reads a single field from the configuration app over its ContentProvider
+     * pipe. Returns "" on any failure so callers can treat absence as "unset".
+     *
+     * An empty [packageNameKey] addresses the global row set (used to discover
+     * which package is currently selected in the UI).
+     */
+    private fun getRemoteConfig(packageNameKey: String, field: String): String {
+        return try {
+            val context = getContext() ?: return ""
+            val uri = Uri.parse("content://$CONFIG_AUTHORITY/$packageNameKey")
+            context.contentResolver
+                .query(uri, arrayOf(field), null, null, null)
+                ?.use { cursor ->
+                    if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getString(0) ?: "" else ""
+                }
+                ?: ""
+        } catch (t: Throwable) {
+            logError("config read failed for $field: ${t.message}")
+            ""
+        }
+    }
+
+    private fun resolveConfig(): SessionConfig? {
+        synchronized(configLock) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            val snapshot = cachedConfig
+            if (snapshot != null && now - cachedConfigAt < CONFIG_CACHE_MS) return snapshot
+
+            val resolved = buildConfig()
+            cachedConfig = resolved
+            cachedConfigAt = now
+            return resolved
+        }
+    }
+
+    private fun buildConfig(): SessionConfig? {
+        val target = getRemoteConfig("", "target_package_to_spoof").trim()
+        if (target.isEmpty()) return null
+        if (getRemoteConfig(target, "enabled") == "false") return null
+
+        // Mode defaults to SET when the UI has never written an explicit value.
+        val mode = getRemoteConfig(target, "mode").trim().toIntOrNull() ?: MODE_SET
+        val durationMs = getRemoteConfig(target, "time").trim().toLongOrNull() ?: 0L
+        return SessionConfig(target, mode, durationMs.coerceAtLeast(0L))
+    }
+
+    // ------------------------------------------------------------ anchor math
+
+    /**
+     * Single source of truth for timing. Both hooks call this so the summary
+     * metrics and the event timeline can never drift apart.
+     */
+    private fun computeAnchors(
+        queryBeginTime: Long,
+        queryEndTime: Long,
+        targetDurationMs: Long,
+        realForegroundMs: Long,
+        mode: Int
+    ): Anchors {
+        val windowMs = (queryEndTime - queryBeginTime).coerceAtLeast(0L)
+
+        val requested = if (mode == MODE_ADD) targetDurationMs + realForegroundMs else targetDurationMs
+
+        // Cap overruns so the synthetic session never claims more time than the
+        // requested window can physically hold.
+        val durationMs = when {
+            requested > windowMs -> (windowMs - WINDOW_HEADROOM_MS).coerceAtLeast(0L)
+            else -> requested.coerceAtLeast(0L)
+        }
+
+        val sessionEnd = queryEndTime - TAIL_ANCHOR_MS
+        val sessionStart = (sessionEnd - durationMs).coerceAtLeast(queryBeginTime)
+
+        return Anchors(queryBeginTime, queryEndTime, sessionStart, sessionEnd, durationMs)
+    }
+
+    // ---------------------------------------------------------- safe mutation
+
+    private fun setLongField(target: Any, name: String, value: Long): Boolean =
+        try {
+            XposedHelpers.setLongField(target, name, value); true
+        } catch (t: Throwable) {
+            false
+        }
+
+    private fun setIntField(target: Any, name: String, value: Int): Boolean =
+        try {
+            XposedHelpers.setIntField(target, name, value); true
+        } catch (t: Throwable) {
+            false
+        }
+
+    private fun getLongField(target: Any, name: String): Long =
+        try {
+            XposedHelpers.getLongField(target, name)
+        } catch (t: Throwable) {
+            0L
+        }
+
+    private fun getIntField(target: Any, name: String): Int =
+        try {
+            XposedHelpers.getIntField(target, name)
+        } catch (t: Throwable) {
+            0
+        }
+
+    private fun zeroOutStats(statsObj: Any) {
+        setLongField(statsObj, "mTotalTimeInForeground", 0L)
+        setLongField(statsObj, "mTotalTimeVisible", 0L)
+        setLongField(statsObj, "mBeginTimeStamp", 0L)
+        setLongField(statsObj, "mEndTimeStamp", 0L)
+        setLongField(statsObj, "mLastTimeUsed", 0L)
+        setLongField(statsObj, "mLastTimeVisible", 0L)
+        setLongField(statsObj, "mAppLaunchCount", 0)
+    }
+
+    // ------------------------------------------------------ UsageEvents access
+
+    /** Lazily resolved, hidden-API constructor for UsageEvents.Event. */
+    private val eventConstructor: Constructor<*>? by lazy {
+        try {
+            Class.forName("android.app.usage.UsageEvents\$Event")
+                .getDeclaredConstructor(
+                    Int::class.javaPrimitiveType,
+                    String::class.java,
+                    String::class.java,
+                    Long::class.javaPrimitiveType
+                )
+                .apply { isAccessible = true }
+        } catch (t: Throwable) {
+            logError("UsageEvents.Event constructor unavailable: ${t.message}")
+            null
+        }
     }
 
     /**
-     * Dynamically scans UsageEvents fields to find the event container.
-     * Returns the first field that is a List or Array, or null if none found.
+     * Scans for the internal ArrayList storage rather than hardcoding "mEvents",
+     * because vendor ROMs rename or reshape that container.
      */
-    private fun findEventContainer(usageEvents: UsageEvents): ArrayList<Any>? {
-        try {
-            val fields = usageEvents.javaClass.declaredFields
-            for (field in fields) {
+    private fun findEventContainer(usageEvents: UsageEvents): ArrayList<Any?>? {
+        return try {
+            for (field in usageEvents.javaClass.declaredFields) {
+                if (!ArrayList::class.java.isAssignableFrom(field.type)) continue
                 field.isAccessible = true
-                val value = field.get(usageEvents) ?: continue
-                if (value is List<*>) {
-                    @Suppress("UNCHECKED_CAST")
-                    return value as? ArrayList<Any>
-                }
-                if (value.javaClass.isArray) {
-                    val list = ArrayList<Any>()
-                    val length = java.lang.reflect.Array.getLength(value)
-                    for (i in 0 until length) {
-                        java.lang.reflect.Array.get(value, i)?.let { list.add(it) }
-                    }
-                    return list
-                }
+                @Suppress("UNCHECKED_CAST")
+                val value = field.get(usageEvents) as? ArrayList<Any?>
+                if (value != null) return value
             }
-        } catch (e: Exception) {
-            log("ERROR", "findEventContainer failed: ${e.message}")
+            null
+        } catch (t: Throwable) {
+            logError("findEventContainer failed: ${t.message}")
+            null
         }
-        return null
     }
 
-    private fun decodeEventType(type: Int): String {
-        return when (type) {
-            1 -> "RESUME"
-            2 -> "PAUSE"
-            5 -> "CONFIG_CHANGE"
-            7 -> "INTERACTION"
-            10 -> "NOTIFICATION_PANEL"
-            13 -> "SCREEN_INTERACTIVE"
-            14 -> "SCREEN_NON_INTERACTIVE"
-            23 -> "STOPPED"
-            26 -> "DEVICE_SHUTDOWN"
-            else -> "UNKNOWN($type)"
+    private fun buildEvent(
+        eventType: Int,
+        packageName: String,
+        className: String,
+        timestamp: Long
+    ): Any? {
+        val ctor = eventConstructor ?: return null
+        return try {
+            ctor.newInstance(eventType, packageName, className, timestamp)
+        } catch (t: Throwable) {
+            logError("event synthesis failed (type=$eventType): ${t.message}")
+            null
         }
     }
+
+    private fun eventTimestamp(event: Any?): Long {
+        if (event == null) return Long.MAX_VALUE
+        return try {
+            XposedHelpers.getLongField(event, FIELD_TIMESTAMP)
+        } catch (t: Throwable) {
+            Long.MAX_VALUE
+        }
+    }
+
+    private fun eventPackage(event: Any?): String? {
+        if (event == null) return null
+        return try {
+            XposedHelpers.getObjectField(event, FIELD_PACKAGE) as? String
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    // ---------------------------------------------------------------- logging
+
+    private fun getContext(): Context? = try {
+        AndroidAppHelper.currentApplication()
+    } catch (t: Throwable) {
+        null
+    }
+
+    /** Success path: one structural line, no disk I/O on the hot path. */
+    private fun log(message: String) {
+        XposedBridge.log(message)
+    }
+
+    /** Failure path: mirrored to the in-app log viewer. */
+    private fun logError(message: String) {
+        XposedBridge.log("[Telemetry-Test] ERROR: $message")
+        getContext()?.let { LogWriter.log(it, "ERROR", message) }
+    }
+
+    // ------------------------------------------------------------------ hooks
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
-        if (lpparam.packageName != hostApp) return
+        if (lpparam.packageName != HOST_APP) return
 
-        log("INIT", "Telemetry Capture Trap active inside: $hostApp")
+        log("[Telemetry-Test] Validation module attached to $HOST_APP")
 
         try {
             val usageStatsManagerClass = XposedHelpers.findClass(
@@ -83,9 +294,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 lpparam.classLoader
             )
 
-            // =================================================================
-            // 1. SUMMARY CAPTURE DECODER (queryUsageStats)
-            // =================================================================
             XposedHelpers.findAndHookMethod(
                 usageStatsManagerClass,
                 "queryUsageStats",
@@ -95,61 +303,81 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
+                            if (param.args.size < 3) return
                             val queryBeginTime = param.args[1] as? Long ?: return
                             val queryEndTime = param.args[2] as? Long ?: return
+
+                            val config = resolveConfig() ?: return
                             val resultList = param.result as? List<*> ?: return
 
-                            val capture = buildString {
-                                appendLine("╔══════════════════════════════════════════════════════════════╗")
-                                appendLine("║           SUMMARY CAPTURE — queryUsageStats                  ║")
-                                appendLine("╠══════════════════════════════════════════════════════════════╣")
-                                appendLine("║ Capture Time: ${formatTimestamp(System.currentTimeMillis())}")
-                                appendLine("║ Query Window: ${formatTimestamp(queryBeginTime)}")
-                                appendLine("║ Query End:   ${formatTimestamp(queryEndTime)}")
-                                appendLine("║ Packages:    ${resultList.size}")
-                                appendLine("╚════════════════════════════════════════════════════════════════╝")
-                            }
-                            log("SUMMARY", capture)
+                            val targetEntry = resultList.firstOrNull { entry ->
+                                statsPackageName(entry) == config.targetPackage
+                            } ?: return
 
-                            for (statsObj in resultList) {
-                                if (statsObj == null) continue
-
-                                try {
-                                    val pkgName = XposedHelpers.getObjectField(statsObj, "mPackageName") as? String ?: "?"
-                                    val beginTimeStamp = XposedHelpers.getLongField(statsObj, "mBeginTimeStamp")
-                                    val endTimeStamp = XposedHelpers.getLongField(statsObj, "mEndTimeStamp")
-                                    val totalTimeInForeground = XposedHelpers.getLongField(statsObj, "mTotalTimeInForeground")
-                                    val totalTimeVisible = XposedHelpers.getLongField(statsObj, "mTotalTimeVisible")
-                                    val lastTimeUsed = XposedHelpers.getLongField(statsObj, "mLastTimeUsed")
-                                    val lastTimeVisible = XposedHelpers.getLongField(statsObj, "mLastTimeVisible")
-                                    val appLaunchCount = XposedHelpers.getIntField(statsObj, "mAppLaunchCount")
-
-                                    val entry = buildString {
-                                        appendLine("┌─ Package: $pkgName")
-                                        appendLine("│  mBeginTimeStamp:        ${formatTimestamp(beginTimeStamp)}")
-                                        appendLine("│  mEndTimeStamp:          ${formatTimestamp(endTimeStamp)}")
-                                        appendLine("│  mTotalTimeInForeground: $totalTimeInForeground ms")
-                                        appendLine("│  mTotalTimeVisible:      $totalTimeVisible ms")
-                                        appendLine("│  mLastTimeUsed:          ${formatTimestamp(lastTimeUsed)}")
-                                        appendLine("│  mLastTimeVisible:       ${formatTimestamp(lastTimeVisible)}")
-                                        appendLine("│  mAppLaunchCount:        $appLaunchCount")
-                                        appendLine("└────────────────────────────────────────────────────────────")
-                                    }
-                                    log("SUMMARY", entry)
-                                } catch (e: Exception) {
-                                    log("ERROR", "Failed to decode UsageStats entry: ${e.message}")
+                            if (config.mode == MODE_HIDE) {
+                                if (resultList is MutableList<Any?>) {
+                                    val removed = resultList.remove(targetEntry)
+                                    if (!removed) zeroOutStats(targetEntry)
+                                } else {
+                                    zeroOutStats(targetEntry)
                                 }
+                                return
                             }
-                        } catch (e: Exception) {
-                            log("ERROR", "queryUsageStats capture failed: ${e.message}")
+
+                            val realForegroundMs =
+                                getLongField(targetEntry, "mTotalTimeInForeground")
+
+                            val anchors = computeAnchors(
+                                queryBeginTime = queryBeginTime,
+                                queryEndTime = queryEndTime,
+                                targetDurationMs = config.targetDurationMs,
+                                realForegroundMs = realForegroundMs,
+                                mode = config.mode
+                            )
+
+                            var allWritesOk = true
+                            allWritesOk = setLongField(
+                                targetEntry, "mTotalTimeInForeground", anchors.durationMs
+                            ) && allWritesOk
+                            allWritesOk = setLongField(
+                                targetEntry, "mTotalTimeVisible", anchors.durationMs
+                            ) && allWritesOk
+                            allWritesOk = setLongField(
+                                targetEntry, "mBeginTimeStamp", anchors.queryBegin
+                            ) && allWritesOk
+                            allWritesOk = setLongField(
+                                targetEntry, "mEndTimeStamp", anchors.queryEnd
+                            ) && allWritesOk
+                            allWritesOk = setLongField(
+                                targetEntry, "mLastTimeUsed", anchors.sessionEnd
+                            ) && allWritesOk
+                            allWritesOk = setLongField(
+                                targetEntry, "mLastTimeVisible", anchors.sessionEnd
+                            ) && allWritesOk
+
+                            val nextLaunchCount = getIntField(targetEntry, "mAppLaunchCount") + 1
+                            allWritesOk = setIntField(
+                                targetEntry, "mAppLaunchCount", nextLaunchCount
+                            ) && allWritesOk
+
+                            if (allWritesOk) {
+                                log(
+                                    "[Telemetry-Test] Synchronized session timeline " +
+                                        "injected successfully for ${config.targetPackage}"
+                                )
+                            } else {
+                                logError(
+                                    "summary injection partially failed for " +
+                                        config.targetPackage
+                                )
+                            }
+                        } catch (t: Throwable) {
+                            logError("queryUsageStats hook failure: ${t.message}")
                         }
                     }
                 }
             )
 
-            // =================================================================
-            // 2. TIMELINE EVENT DECODER (queryEvents)
-            // =================================================================
             XposedHelpers.findAndHookMethod(
                 usageStatsManagerClass,
                 "queryEvents",
@@ -158,57 +386,120 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
+                            if (param.args.size < 2) return
                             val queryBeginTime = param.args[0] as? Long ?: return
                             val queryEndTime = param.args[1] as? Long ?: return
+
+                            val config = resolveConfig() ?: return
                             val usageEvents = param.result as? UsageEvents ?: return
 
-                            val eventContainer = findEventContainer(usageEvents)
-                            if (eventContainer == null) {
-                                log("ERROR", "Could not find event container in UsageEvents")
+                            val container = findEventContainer(usageEvents) ?: return
+
+                            if (config.mode == MODE_HIDE) {
+                                val removed = container.removeAll {
+                                    eventPackage(it) == config.targetPackage
+                                }
+                                log(
+                                    "[Telemetry-Test] Synchronized session timeline " +
+                                        "injected successfully for ${config.targetPackage} " +
+                                        "(hidden, $removed events removed)"
+                                )
                                 return
                             }
 
-                            val capture = buildString {
-                                appendLine("╔══════════════════════════════════════════════════════════════╗")
-                                appendLine("║          TIMELINE CAPTURE — queryEvents                      ║")
-                                appendLine("╠══════════════════════════════════════════════════════════════╣")
-                                appendLine("║ Capture Time: ${formatTimestamp(System.currentTimeMillis())}")
-                                appendLine("║ Query Window: ${formatTimestamp(queryBeginTime)}")
-                                appendLine("║ Query End:   ${formatTimestamp(queryEndTime)}")
-                                appendLine("║ Total Events: ${eventContainer.size}")
-                                appendLine("╚════════════════════════════════════════════════════════════════╝")
-                            }
-                            log("TIMELINE", capture)
+                            // Identical anchor math to the summary hook.
+                            //
+                            // Timeline events carry no duration field, so ADD mode has
+                            // no real foreground total to accumulate here. The summary
+                            // hook is the authority for that value; passing 0 keeps the
+                            // injected timeline consistent with the requested duration.
+                            val anchors = computeAnchors(
+                                queryBeginTime = queryBeginTime,
+                                queryEndTime = queryEndTime,
+                                targetDurationMs = config.targetDurationMs,
+                                realForegroundMs = 0L,
+                                mode = config.mode
+                            )
 
-                            for ((index, event) in eventContainer.withIndex()) {
-                                try {
-                                    val pkg = XposedHelpers.getObjectField(event, "mPackage") as? String ?: "?"
-                                    val cls = XposedHelpers.getObjectField(event, "mClass") as? String ?: "?"
-                                    val type = XposedHelpers.getIntField(event, "mEventType")
-                                    val timestamp = XposedHelpers.getLongField(event, "mTimeStamp")
+                            // Drop the package's real triggers so nothing collides.
+                            container.removeAll { eventPackage(it) == config.targetPackage }
 
-                                    val entry = buildString {
-                                        appendLine("┌─ Event[$index]")
-                                        appendLine("│  mPackage:    $pkg")
-                                        appendLine("│  mClass:      $cls")
-                                        appendLine("│  mEventType:  $type (${decodeEventType(type)})")
-                                        appendLine("│  mTimeStamp:  ${formatTimestamp(timestamp)}")
-                                        appendLine("└────────────────────────────────────────────────────────────")
-                                    }
-                                    log("TIMELINE", entry)
-                                } catch (e: Exception) {
-                                    log("ERROR", "Failed to decode event[$index]: ${e.message}")
-                                }
+                            val injected = mutableListOf<Any>()
+
+                            buildEvent(
+                                EVENT_MOVE_TO_FOREGROUND,
+                                config.targetPackage,
+                                config.targetPackage,
+                                anchors.sessionStart
+                            )?.let(injected::add)
+
+                            buildEvent(
+                                EVENT_MOVE_TO_BACKGROUND,
+                                config.targetPackage,
+                                config.targetPackage,
+                                anchors.sessionEnd
+                            )?.let(injected::add)
+
+                            val firstInteraction = anchors.sessionStart + INTERACTION_OFFSET_MS
+                            val lastInteraction = anchors.sessionEnd - INTERACTION_OFFSET_MS
+                            if (firstInteraction < lastInteraction) {
+                                buildEvent(
+                                    EVENT_USER_INTERACTION,
+                                    config.targetPackage,
+                                    config.targetPackage,
+                                    firstInteraction
+                                )?.let(injected::add)
+                                buildEvent(
+                                    EVENT_USER_INTERACTION,
+                                    config.targetPackage,
+                                    config.targetPackage,
+                                    lastInteraction
+                                )?.let(injected::add)
+                            } else {
+                                // Session shorter than 2 * offset: one midpoint
+                                // interaction keeps the lifecycle well-formed.
+                                buildEvent(
+                                    EVENT_USER_INTERACTION,
+                                    config.targetPackage,
+                                    config.targetPackage,
+                                    anchors.sessionStart +
+                                        (anchors.sessionEnd - anchors.sessionStart) / 2
+                                )?.let(injected::add)
                             }
-                        } catch (e: Exception) {
-                            log("ERROR", "queryEvents capture failed: ${e.message}")
+
+                            if (injected.isEmpty()) {
+                                logError(
+                                    "no synthetic events could be built for " +
+                                        config.targetPackage
+                                )
+                                return
+                            }
+
+                            container.addAll(injected)
+                            // The sandbox engine parses a chronological timeline.
+                            container.sortBy { eventTimestamp(it) }
+
+                            log(
+                                "[Telemetry-Test] Synchronized session timeline " +
+                                    "injected successfully for ${config.targetPackage}"
+                            )
+                        } catch (t: Throwable) {
+                            logError("queryEvents hook failure: ${t.message}")
                         }
                     }
                 }
             )
+        } catch (t: Throwable) {
+            logError("critical initialization failure: ${t.message}")
+        }
+    }
 
-        } catch (e: Exception) {
-            log("ERROR", "Critical initialization failure: ${e.message}")
+    private fun statsPackageName(statsObj: Any?): String? {
+        if (statsObj == null) return null
+        return try {
+            XposedHelpers.getObjectField(statsObj, "mPackageName") as? String
+        } catch (t: Throwable) {
+            null
         }
     }
 }
