@@ -85,11 +85,29 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
     private fun getRemoteConfig(packageNameKey: String, field: String): String {
         return try {
             val context = getContext() ?: return ""
-            val uri = Uri.parse("content://$CONFIG_AUTHORITY/$packageNameKey")
+            val uri = Uri.parse("content://$CONFIG_AUTHORITY/${Uri.encode(packageNameKey)}")
             context.contentResolver
-                .query(uri, arrayOf(field), null, null, null)
+                .query(uri, null, null, null, null)
                 ?.use { cursor ->
-                    if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getString(0) ?: "" else ""
+                    // The provider returns a key/value matrix and ignores the
+                    // projection argument, so column 0 is the KEY, not the value.
+                    // Read by column name and match the row, otherwise every lookup
+                    // silently returns the field name itself.
+                    val keyIndex = cursor.getColumnIndex("key")
+                    val valueIndex = cursor.getColumnIndex("value")
+                    if (keyIndex < 0 || valueIndex < 0) return@use ""
+
+                    // Position on the first row before iterating; moveToNext()
+                    // alone would skip row 0.
+                    if (!cursor.moveToFirst()) return@use ""
+
+                    do {
+                        if (cursor.getString(keyIndex) == field) {
+                            return cursor.getString(valueIndex) ?: ""
+                        }
+                    } while (cursor.moveToNext())
+
+                    ""
                 }
                 ?: ""
         } catch (t: Throwable) {
