@@ -220,13 +220,13 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         }
 
         val candidates = listOf(
-            arrayOf<Any>(
+            arrayOf<Class<*>>(
                 Int::class.javaPrimitiveType!!,
                 String::class.java,
                 String::class.java,
                 Long::class.javaPrimitiveType!!
             ),
-            arrayOf<Any>(
+            arrayOf<Class<*>>(
                 Int::class.javaPrimitiveType!!,
                 String::class.java,
                 String::class.java,
