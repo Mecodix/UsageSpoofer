@@ -632,7 +632,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                                 log(
                                     "[Telemetry-Test] Synchronized session timeline " +
                                         "injected successfully for ${config.targetPackage} " +
-                                        "(wrote=${anchors.durationMs}ms readBack=$verifiedms " +
+                                        "(wrote=${anchors.durationMs}ms readBack=${verified}ms " +
                                         "expected=${anchors.durationMs}ms)"
                                 )
                             } else {
