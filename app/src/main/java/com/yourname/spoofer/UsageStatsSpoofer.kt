@@ -442,6 +442,15 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
     private var hiddenApiExemption: String? = null
 
     /**
+     * Final duration from the most recent summary injection.
+     *
+     * The timeline reuses it so a reader summing foreground spans sees exactly
+     * what the summary row reports, instead of the requested amount alone.
+     */
+    @Volatile
+    private var lastInjectedDurationMs: Long? = null
+
+    /**
      * Grants this process a hidden API exemption before any framework reflection
      * is attempted.
      *
@@ -627,6 +636,12 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                                 // success while ART has quietly discarded the write,
                                 // so verify rather than trust the setter.
                                 val verified = getLongField(targetEntry, "mTotalTimeInForeground")
+
+                                // A reader that computes its total from the
+                                // event timeline must see the same duration the
+                                // summary reports, so share the final value.
+                                lastInjectedDurationMs = anchors.durationMs
+
                                 log(
                                     "[Telemetry-Test] SUMMARY injected for ${config.targetPackage} " +
                                         "(wrote=${anchors.durationMs}ms readBack=${verified}ms " +
@@ -656,6 +671,33 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 summaryHook
             )
 
+
+            hookUsageStatsVariants(
+                usageStatsManagerClass,
+                "queryEvents",
+                arrayOf(
+                    Long::class.javaPrimitiveType!!,
+                    Long::class.javaPrimitiveType!!
+                ),
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        try {
+                            if (param.args.size < 2) return
+                            val queryBeginTime = param.args[0] as? Long ?: return
+                            val queryEndTime = param.args[1] as? Long ?: return
+
+                            applyTimeline(param.result, queryBeginTime, queryEndTime)
+                        } catch (t: Throwable) {
+                            logError("queryEvents hook failure: ${t.message}")
+                        }
+                    }
+                }
+            )
+        } catch (t: Throwable) {
+            logError("critical initialization failure: ${t.message}")
+        }
+    }
+
     /** Timeline mutation, shared by queryEvents and queryEventsAsUser. */
     private fun applyTimeline(result: Any?, queryBeginTime: Long, queryEndTime: Long) {
         try {
@@ -678,16 +720,18 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
 
             // Identical anchor math to the summary hook.
             //
-            // Timeline events carry no duration field, so ADD mode has
-            // no real foreground total to accumulate here. The summary
-            // hook is the authority for that value; passing 0 keeps the
-            // injected timeline consistent with the requested duration.
+            // Events carry no duration field, so ADD mode cannot read a real
+            // foreground total here. Reuse the final value the summary hook
+            // already computed (real + added, capped) so a reader summing
+            // foreground spans agrees with the summary row. Fall back to the
+            // configured amount before any summary query has run.
+            val timelineDurationMs = lastInjectedDurationMs ?: config.targetDurationMs
             val anchors = computeAnchors(
                 queryBeginTime = queryBeginTime,
                 queryEndTime = queryEndTime,
-                targetDurationMs = config.targetDurationMs,
+                targetDurationMs = timelineDurationMs,
                 realForegroundMs = 0L,
-                mode = config.mode
+                mode = MODE_SET
             )
 
             // Drop the package's real triggers so nothing collides.
@@ -760,32 +804,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
             )
         } catch (t: Throwable) {
             logError("queryEvents hook failure: ${t.message}")
-        }
-    }
-
-            hookUsageStatsVariants(
-                usageStatsManagerClass,
-                "queryEvents",
-                arrayOf(
-                    Long::class.javaPrimitiveType!!,
-                    Long::class.javaPrimitiveType!!
-                ),
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        try {
-                            if (param.args.size < 2) return
-                            val queryBeginTime = param.args[0] as? Long ?: return
-                            val queryEndTime = param.args[1] as? Long ?: return
-
-                            applyTimeline(param.result, queryBeginTime, queryEndTime)
-                        } catch (t: Throwable) {
-                            logError("queryEvents hook failure: ${t.message}")
-                        }
-                    }
-                }
-            )
-        } catch (t: Throwable) {
-            logError("critical initialization failure: ${t.message}")
         }
     }
 
