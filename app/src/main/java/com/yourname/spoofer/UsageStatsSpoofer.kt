@@ -542,15 +542,13 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 classLoader
             )
 
-            XposedHelpers.findAndHookMethod(
-                usageStatsManagerClass,
-                "queryUsageStats",
-                Int::class.javaPrimitiveType,
-                Long::class.javaPrimitiveType,
-                Long::class.javaPrimitiveType,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        try {
+            // Summary hook. Android 10+ apps increasingly call the AsUser variant,
+            // which takes a trailing userId. Hook both so a reader using either
+            // entry point is covered; the handler reads begin/end by position and
+            // tolerates the extra trailing argument.
+            val summaryHook = object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    try {
                             if (param.args.size < 3) return
                             val queryBeginTime = param.args[1] as? Long ?: return
                             val queryEndTime = param.args[2] as? Long ?: return
@@ -630,10 +628,9 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                                 // so verify rather than trust the setter.
                                 val verified = getLongField(targetEntry, "mTotalTimeInForeground")
                                 log(
-                                    "[Telemetry-Test] Synchronized session timeline " +
-                                        "injected successfully for ${config.targetPackage} " +
+                                    "[Telemetry-Test] SUMMARY injected for ${config.targetPackage} " +
                                         "(wrote=${anchors.durationMs}ms readBack=${verified}ms " +
-                                        "expected=${anchors.durationMs}ms)"
+                                        "real=${realForegroundMs}ms)"
                                 )
                             } else {
                                 logError(
@@ -646,14 +643,133 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                             logError("queryUsageStats hook failure: ${t.message}")
                         }
                     }
-                }
+            }
+
+            hookUsageStatsVariants(
+                usageStatsManagerClass,
+                "queryUsageStats",
+                arrayOf(
+                    Int::class.javaPrimitiveType!!,
+                    Long::class.javaPrimitiveType!!,
+                    Long::class.javaPrimitiveType!!
+                ),
+                summaryHook
             )
 
-            XposedHelpers.findAndHookMethod(
+    /** Timeline mutation, shared by queryEvents and queryEventsAsUser. */
+    private fun applyTimeline(result: Any?, queryBeginTime: Long, queryEndTime: Long) {
+        try {
+            val config = resolveConfig() ?: return
+            val usageEvents = result as? UsageEvents ?: return
+
+            val container = findEventContainer(usageEvents) ?: return
+
+            if (config.mode == MODE_HIDE) {
+                val removed = container.removeAll {
+                    eventPackage(it) == config.targetPackage
+                }
+                log(
+                    "[Telemetry-Test] Synchronized session timeline " +
+                        "injected successfully for ${config.targetPackage} " +
+                        "(hidden, $removed events removed)"
+                )
+                return
+            }
+
+            // Identical anchor math to the summary hook.
+            //
+            // Timeline events carry no duration field, so ADD mode has
+            // no real foreground total to accumulate here. The summary
+            // hook is the authority for that value; passing 0 keeps the
+            // injected timeline consistent with the requested duration.
+            val anchors = computeAnchors(
+                queryBeginTime = queryBeginTime,
+                queryEndTime = queryEndTime,
+                targetDurationMs = config.targetDurationMs,
+                realForegroundMs = 0L,
+                mode = config.mode
+            )
+
+            // Drop the package's real triggers so nothing collides.
+            val removedCount =
+                container.removeAll { eventPackage(it) == config.targetPackage }
+
+            val injected = mutableListOf<Any>()
+
+            buildEvent(
+                EVENT_MOVE_TO_FOREGROUND,
+                config.targetPackage,
+                config.targetPackage,
+                anchors.sessionStart
+            )?.let(injected::add)
+
+            buildEvent(
+                EVENT_MOVE_TO_BACKGROUND,
+                config.targetPackage,
+                config.targetPackage,
+                anchors.sessionEnd
+            )?.let(injected::add)
+
+            val firstInteraction = anchors.sessionStart + INTERACTION_OFFSET_MS
+            val lastInteraction = anchors.sessionEnd - INTERACTION_OFFSET_MS
+            if (firstInteraction < lastInteraction) {
+                buildEvent(
+                    EVENT_USER_INTERACTION,
+                    config.targetPackage,
+                    config.targetPackage,
+                    firstInteraction
+                )?.let(injected::add)
+                buildEvent(
+                    EVENT_USER_INTERACTION,
+                    config.targetPackage,
+                    config.targetPackage,
+                    lastInteraction
+                )?.let(injected::add)
+            } else {
+                // Session shorter than 2 * offset: one midpoint
+                // interaction keeps the lifecycle well-formed.
+                buildEvent(
+                    EVENT_USER_INTERACTION,
+                    config.targetPackage,
+                    config.targetPackage,
+                    anchors.sessionStart +
+                        (anchors.sessionEnd - anchors.sessionStart) / 2
+                )?.let(injected::add)
+            }
+
+            if (injected.isEmpty()) {
+                logError(
+                    "no synthetic events could be built for " +
+                        config.targetPackage
+                )
+                return
+            }
+
+            container.addAll(injected)
+            // The sandbox engine parses a chronological timeline.
+            container.sortBy { eventTimestamp(it) }
+
+            // A progress-bar UI typically derives its fill from
+            // these events, so report the shape we produced.
+            log(
+                "[Telemetry-Test] TIMELINE injected for " +
+                    "${config.targetPackage}: removed=${removedCount} " +
+                    "injected=${injected.size} total=${container.size} " +
+                    "window=${anchors.sessionEnd - anchors.sessionStart}ms " +
+                    "events=${injected.map { eventTimestamp(it) - anchors.sessionStart }}"
+            )
+        } catch (t: Throwable) {
+            logError("queryEvents hook failure: ${t.message}")
+        }
+    }
+
+            hookUsageStatsVariants(
                 usageStatsManagerClass,
                 "queryEvents",
-                Long::class.javaPrimitiveType,
-                Long::class.javaPrimitiveType,
+                arrayOf(
+                    Long::class.javaPrimitiveType!!,
+                    Long::class.javaPrimitiveType!!
+                ),
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
@@ -661,99 +777,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                             val queryBeginTime = param.args[0] as? Long ?: return
                             val queryEndTime = param.args[1] as? Long ?: return
 
-                            val config = resolveConfig() ?: return
-                            val usageEvents = param.result as? UsageEvents ?: return
-
-                            val container = findEventContainer(usageEvents) ?: return
-
-                            if (config.mode == MODE_HIDE) {
-                                val removed = container.removeAll {
-                                    eventPackage(it) == config.targetPackage
-                                }
-                                log(
-                                    "[Telemetry-Test] Synchronized session timeline " +
-                                        "injected successfully for ${config.targetPackage} " +
-                                        "(hidden, $removed events removed)"
-                                )
-                                return
-                            }
-
-                            // Identical anchor math to the summary hook.
-                            //
-                            // Timeline events carry no duration field, so ADD mode has
-                            // no real foreground total to accumulate here. The summary
-                            // hook is the authority for that value; passing 0 keeps the
-                            // injected timeline consistent with the requested duration.
-                            val anchors = computeAnchors(
-                                queryBeginTime = queryBeginTime,
-                                queryEndTime = queryEndTime,
-                                targetDurationMs = config.targetDurationMs,
-                                realForegroundMs = 0L,
-                                mode = config.mode
-                            )
-
-                            // Drop the package's real triggers so nothing collides.
-                            container.removeAll { eventPackage(it) == config.targetPackage }
-
-                            val injected = mutableListOf<Any>()
-
-                            buildEvent(
-                                EVENT_MOVE_TO_FOREGROUND,
-                                config.targetPackage,
-                                config.targetPackage,
-                                anchors.sessionStart
-                            )?.let(injected::add)
-
-                            buildEvent(
-                                EVENT_MOVE_TO_BACKGROUND,
-                                config.targetPackage,
-                                config.targetPackage,
-                                anchors.sessionEnd
-                            )?.let(injected::add)
-
-                            val firstInteraction = anchors.sessionStart + INTERACTION_OFFSET_MS
-                            val lastInteraction = anchors.sessionEnd - INTERACTION_OFFSET_MS
-                            if (firstInteraction < lastInteraction) {
-                                buildEvent(
-                                    EVENT_USER_INTERACTION,
-                                    config.targetPackage,
-                                    config.targetPackage,
-                                    firstInteraction
-                                )?.let(injected::add)
-                                buildEvent(
-                                    EVENT_USER_INTERACTION,
-                                    config.targetPackage,
-                                    config.targetPackage,
-                                    lastInteraction
-                                )?.let(injected::add)
-                            } else {
-                                // Session shorter than 2 * offset: one midpoint
-                                // interaction keeps the lifecycle well-formed.
-                                buildEvent(
-                                    EVENT_USER_INTERACTION,
-                                    config.targetPackage,
-                                    config.targetPackage,
-                                    anchors.sessionStart +
-                                        (anchors.sessionEnd - anchors.sessionStart) / 2
-                                )?.let(injected::add)
-                            }
-
-                            if (injected.isEmpty()) {
-                                logError(
-                                    "no synthetic events could be built for " +
-                                        config.targetPackage
-                                )
-                                return
-                            }
-
-                            container.addAll(injected)
-                            // The sandbox engine parses a chronological timeline.
-                            container.sortBy { eventTimestamp(it) }
-
-                            log(
-                                "[Telemetry-Test] Synchronized session timeline " +
-                                    "injected successfully for ${config.targetPackage}"
-                            )
+                            applyTimeline(param.result, queryBeginTime, queryEndTime)
                         } catch (t: Throwable) {
                             logError("queryEvents hook failure: ${t.message}")
                         }
@@ -762,6 +786,44 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
             )
         } catch (t: Throwable) {
             logError("critical initialization failure: ${t.message}")
+        }
+    }
+
+    /**
+     * Hooks both the plain method and its trailing-userId AsUser variant.
+     *
+     * Apps on Android 10+ increasingly call queryUsageStatsAsUser /
+     * queryEventsAsUser, so hooking only the plain name leaves those readers
+     * untouched. The variant may be absent on some builds, which is not fatal.
+     */
+    private fun hookUsageStatsVariants(
+        usageStatsManagerClass: Class<*>,
+        methodName: String,
+        leadingParams: Array<Class<*>>,
+        callback: XC_MethodHook
+    ) {
+        try {
+            XposedHelpers.findAndHookMethod(
+                usageStatsManagerClass,
+                methodName,
+                *leadingParams,
+                callback
+            )
+        } catch (t: Throwable) {
+            logError("could not hook $methodName: ${t.message}")
+        }
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                usageStatsManagerClass,
+                "${methodName}AsUser",
+                *leadingParams,
+                Int::class.javaPrimitiveType!!,
+                callback
+            )
+        } catch (t: Throwable) {
+            // Very common: not every build exposes the AsUser overload.
+            XposedBridge.log("[Telemetry-Test] ${methodName}AsUser not present, skipped")
         }
     }
 
