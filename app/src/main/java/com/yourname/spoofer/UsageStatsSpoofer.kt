@@ -166,9 +166,22 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
 
         val requested = if (mode == MODE_ADD) targetDurationMs + realForegroundMs else targetDurationMs
 
-        // Cap overruns so the synthetic session never claims more time than the
-        // requested window can physically hold.
+        // Cap the *total* against the window so the synthetic session cannot claim
+        // more time than the window can physically hold.
+        //
+        // In ADD mode the requested amount is real + added, so capping that sum
+        // would silently discard most of the addition whenever the app queries a
+        // window shorter than (real + requested). Cap the headroom instead and let
+        // the addition survive; the remainder is genuinely unspent window time.
         val durationMs = when {
+            mode == MODE_ADD -> {
+                val available = (windowMs - WINDOW_HEADROOM_MS).coerceAtLeast(0L)
+                // Never report less than real usage, and never invent time beyond
+                // the window.
+                (realForegroundMs + targetDurationMs)
+                    .coerceAtMost(available.coerceAtLeast(realForegroundMs))
+                    .coerceAtLeast(0L)
+            }
             requested > windowMs -> (windowMs - WINDOW_HEADROOM_MS).coerceAtLeast(0L)
             else -> requested.coerceAtLeast(0L)
         }
@@ -574,6 +587,12 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
 
                             val realForegroundMs =
                                 getLongField(targetEntry, "mTotalTimeInForeground")
+                            log(
+                                "[Telemetry-Test] summary match: real=" +
+                                    "${realForegroundMs}ms window=${queryEndTime - queryBeginTime}ms " +
+                                    "intervalType=${param.args[0]} mode=${config.mode} " +
+                                    "addMs=${config.targetDurationMs}"
+                            )
 
                             val anchors = computeAnchors(
                                 queryBeginTime = queryBeginTime,
@@ -606,9 +625,15 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                             }
 
                             if (failed.isEmpty()) {
+                                // Read the value back. XposedHelpers can report
+                                // success while ART has quietly discarded the write,
+                                // so verify rather than trust the setter.
+                                val verified = getLongField(targetEntry, "mTotalTimeInForeground")
                                 log(
                                     "[Telemetry-Test] Synchronized session timeline " +
-                                        "injected successfully for ${config.targetPackage}"
+                                        "injected successfully for ${config.targetPackage} " +
+                                        "(wrote=${anchors.durationMs}ms readBack=$verifiedms " +
+                                        "expected=${anchors.durationMs}ms)"
                                 )
                             } else {
                                 logError(
