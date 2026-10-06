@@ -322,10 +322,11 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
     @Volatile
     private var appContext: Context? = null
 
-    private fun awaitApplication() {
+    private fun awaitApplication(classLoader: ClassLoader) {
         try {
             XposedHelpers.findAndHookMethod(
                 "android.app.Application",
+                classLoader,
                 "attach",
                 Context::class.java,
                 object : XC_MethodHook() {
@@ -354,7 +355,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
 
         // currentApplication() is often still null at this point in startup, so hook
         // Application.attach to establish the context used by the log sink.
-        awaitApplication()
+        awaitApplication(lpparam.classLoader)
 
         try {
             val usageStatsManagerClass = XposedHelpers.findClass(
