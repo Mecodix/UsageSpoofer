@@ -6,43 +6,30 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
 import android.app.AndroidAppHelper
-import android.net.Uri
-import android.app.usage.UsageStats
 import android.app.usage.UsageEvents
+import android.app.usage.UsageStats
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class UsageStatsSpoofer : IXposedHookLoadPackage {
 
-    companion object {
-        // Shared session timestamps — both hooks read from this
-        @Volatile var sessionStart: Long = 0L
-        @Volatile var sessionEnd: Long = 0L
+    private val hostApp = "com.rayole.cashromeo2"
+    private val dateFormat = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.getDefault())
+
+    private fun formatTimestamp(epochMs: Long): String {
+        return "${dateFormat.format(Date(epochMs))} ($epochMs)"
     }
 
-    // Helper method to safely query your UI app configuration across sandboxed processes
-    private fun getRemoteConfig(packageNameKey: String, field: String): String {
-        try {
-            val context = AndroidAppHelper.currentApplication() ?: return ""
-            // Accesses the custom ContentProvider database exposed by your UI application
-            val uri = Uri.parse("content://com.yourname.spoofer.configprovider/$packageNameKey")
-            val cursor = context.contentResolver.query(uri, null, null, null, null)
-            
-            cursor?.use {
-                while (it.moveToNext()) {
-                    val currentKey = it.getString(0) // Column: key
-                    if (currentKey == field) {
-                        return it.getString(1) // Column: value
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            XposedBridge.log("[GodMode] Config Provider Retrieval Failure: ${e.message}")
-        }
-        return ""
+    private fun getContext() = AndroidAppHelper.currentApplication()
+
+    private fun log(tag: String, message: String) {
+        XposedBridge.log("[Telemetry] $message")
+        getContext()?.let { LogWriter.log(it, tag, message) }
     }
 
     /**
      * Dynamically scans UsageEvents fields to find the event container.
-     * Field names vary across OEM ROMs and Android versions (mEventList, mEvents, etc.).
      * Returns the first field that is a List or Array, or null if none found.
      */
     private fun findEventContainer(usageEvents: UsageEvents): ArrayList<Any>? {
@@ -51,13 +38,11 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
             for (field in fields) {
                 field.isAccessible = true
                 val value = field.get(usageEvents) ?: continue
-                // Check if it's a List or Array
                 if (value is List<*>) {
                     @Suppress("UNCHECKED_CAST")
                     return value as? ArrayList<Any>
                 }
                 if (value.javaClass.isArray) {
-                    // Convert array to ArrayList
                     val list = ArrayList<Any>()
                     val length = java.lang.reflect.Array.getLength(value)
                     for (i in 0 until length) {
@@ -67,264 +52,163 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 }
             }
         } catch (e: Exception) {
-            XposedBridge.log("[GodMode] findEventContainer error: ${e.message}")
+            log("ERROR", "findEventContainer failed: ${e.message}")
         }
         return null
     }
 
+    private fun decodeEventType(type: Int): String {
+        return when (type) {
+            1 -> "RESUME"
+            2 -> "PAUSE"
+            5 -> "CONFIG_CHANGE"
+            7 -> "INTERACTION"
+            10 -> "NOTIFICATION_PANEL"
+            13 -> "SCREEN_INTERACTIVE"
+            14 -> "SCREEN_NON_INTERACTIVE"
+            23 -> "STOPPED"
+            26 -> "DEVICE_SHUTDOWN"
+            else -> "UNKNOWN($type)"
+        }
+    }
+
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
-        // The host tracker application processing the telemetry SDK
-        val hostApp = "com.rayole.cashromeo2" 
-        
         if (lpparam.packageName != hostApp) return
 
-        XposedBridge.log("[GodMode] Adaptive Spoofer fully active inside: $hostApp")
+        log("INIT", "Telemetry Capture Trap active inside: $hostApp")
 
         try {
             val usageStatsManagerClass = XposedHelpers.findClass(
-                "android.app.usage.UsageStatsManager", 
+                "android.app.usage.UsageStatsManager",
                 lpparam.classLoader
             )
 
             // =================================================================
-            // 1. HOOK: Summary Statistics (queryUsageStats)
+            // 1. SUMMARY CAPTURE DECODER (queryUsageStats)
             // =================================================================
             XposedHelpers.findAndHookMethod(
                 usageStatsManagerClass,
                 "queryUsageStats",
-                Int::class.javaPrimitiveType,  // intervalType
-                Long::class.javaPrimitiveType, // beginTime
-                Long::class.javaPrimitiveType, // endTime
+                Int::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        // Check if spoofer is enabled
-                        val isEnabled = getRemoteConfig("", "spoofer_enabled")
-                        if (isEnabled == "false") return
+                        try {
+                            val queryBeginTime = param.args[1] as? Long ?: return
+                            val queryEndTime = param.args[2] as? Long ?: return
+                            val resultList = param.result as? List<*> ?: return
 
-                        val queryBeginTime = param.args[1] as Long
-                        val queryEndTime = param.args[2] as Long
-                        val resultList = param.result as? List<*> ?: return
+                            val capture = buildString {
+                                appendLine("╔══════════════════════════════════════════════════════════════╗")
+                                appendLine("║           SUMMARY CAPTURE — queryUsageStats                  ║")
+                                appendLine("╠══════════════════════════════════════════════════════════════╣")
+                                appendLine("║ Capture Time: ${formatTimestamp(System.currentTimeMillis())}")
+                                appendLine("║ Query Window: ${formatTimestamp(queryBeginTime)}")
+                                appendLine("║ Query End:   ${formatTimestamp(queryEndTime)}")
+                                appendLine("║ Packages:    ${resultList.size}")
+                                appendLine("╚════════════════════════════════════════════════════════════════╝")
+                            }
+                            log("SUMMARY", capture)
 
-                        for (statsObj in resultList) {
-                            if (statsObj == null) continue
-                            
-                            val pkgName = XposedHelpers.getObjectField(statsObj, "mPackageName") as? String ?: continue
-                            
-                            // Check if this package matches our target directly
-                            val appToSpoof = getRemoteConfig("", "target_package_to_spoof")
-                            if (pkgName != appToSpoof) continue
+                            for (statsObj in resultList) {
+                                if (statsObj == null) continue
 
-                            // Safely retrieve the dynamic duration configurations set via your UI spinner/input
-                            val savedTimeMsStr = getRemoteConfig("", "time")
-                            val modeStr = getRemoteConfig("", "mode")
-                            
-                            val inputDurationMs = savedTimeMsStr.toLongOrNull() ?: 360000L // Defaults to 6 mins
-                            val mode = modeStr.toIntOrNull() ?: 0 // 0 = SET, 1 = ADD, 2 = HIDE
+                                try {
+                                    val pkgName = XposedHelpers.getObjectField(statsObj, "mPackageName") as? String ?: "?"
+                                    val beginTimeStamp = XposedHelpers.getLongField(statsObj, "mBeginTimeStamp")
+                                    val endTimeStamp = XposedHelpers.getLongField(statsObj, "mEndTimeStamp")
+                                    val totalTimeInForeground = XposedHelpers.getLongField(statsObj, "mTotalTimeInForeground")
+                                    val totalTimeVisible = XposedHelpers.getLongField(statsObj, "mTotalTimeVisible")
+                                    val lastTimeUsed = XposedHelpers.getLongField(statsObj, "mLastTimeUsed")
+                                    val lastTimeVisible = XposedHelpers.getLongField(statsObj, "mLastTimeVisible")
+                                    val appLaunchCount = XposedHelpers.getIntField(statsObj, "mAppLaunchCount")
 
-                            val maxAvailableWindow = queryEndTime - queryBeginTime
-                            var finalDurationMs = inputDurationMs
-
-                            // Calculate target variables based on your UI's Spinner Selection
-                            when (mode) {
-                                0 -> { // SET mode: Forces target value directly
-                                    if (finalDurationMs > maxAvailableWindow) {
-                                        finalDurationMs = maxAvailableWindow - 5000L 
+                                    val entry = buildString {
+                                        appendLine("┌─ Package: $pkgName")
+                                        appendLine("│  mBeginTimeStamp:        ${formatTimestamp(beginTimeStamp)}")
+                                        appendLine("│  mEndTimeStamp:          ${formatTimestamp(endTimeStamp)}")
+                                        appendLine("│  mTotalTimeInForeground: $totalTimeInForeground ms")
+                                        appendLine("│  mTotalTimeVisible:      $totalTimeVisible ms")
+                                        appendLine("│  mLastTimeUsed:          ${formatTimestamp(lastTimeUsed)}")
+                                        appendLine("│  mLastTimeVisible:       ${formatTimestamp(lastTimeVisible)}")
+                                        appendLine("│  mAppLaunchCount:        $appLaunchCount")
+                                        appendLine("└────────────────────────────────────────────────────────────")
                                     }
-                                }
-                                1 -> { // ADD mode: Extends existing foreground duration
-                                    val currentRealTime = XposedHelpers.getLongField(statsObj, "mTotalTimeInForeground")
-                                    finalDurationMs = currentRealTime + inputDurationMs
-                                }
-                                2 -> { // HIDE mode: Zeroes out telemetry tracks
-                                    finalDurationMs = 0L
+                                    log("SUMMARY", entry)
+                                } catch (e: Exception) {
+                                    log("ERROR", "Failed to decode UsageStats entry: ${e.message}")
                                 }
                             }
-
-                            // Calculate and STORE timestamps for both hooks to share
-                            val sessionStart = queryBeginTime + 500L
-                            val sessionEnd = (queryBeginTime + finalDurationMs).coerceAtMost(queryEndTime)
-                            UsageStatsSpoofer.sessionStart = sessionStart
-                            UsageStatsSpoofer.sessionEnd = sessionEnd
-
-                            // Modify the summary analytics payload fields inside memory
-                            XposedHelpers.setLongField(statsObj, "mTotalTimeInForeground", finalDurationMs)
-                            XposedHelpers.setLongField(statsObj, "mBeginTimeStamp", sessionStart)
-                            XposedHelpers.setLongField(statsObj, "mEndTimeStamp", sessionEnd)
-
-                            // Fix "Last Seen" disconnect — anchor to session end
-                            XposedHelpers.setLongField(statsObj, "mLastTimeUsed", sessionEnd - 2000L)
-                            XposedHelpers.setLongField(statsObj, "mLastTimeVisible", sessionEnd - 2000L)
-
-                            // Increment launch count by 1 (progressive tracking)
-                            val currentLaunchCount = XposedHelpers.getIntField(statsObj, "mAppLaunchCount")
-                            XposedHelpers.setIntField(statsObj, "mAppLaunchCount", currentLaunchCount + 1)
-
-                            // Log all hidden fields for audit (compare real vs spoof sessions)
-                            val logMsg = buildString {
-                                appendLine("=== FIELD AUDIT for $pkgName ===")
-                                appendLine("mPackageName: $pkgName")
-                                appendLine("mTotalTimeInForeground: ${XposedHelpers.getLongField(statsObj, "mTotalTimeInForeground")}")
-                                appendLine("mLastTimeUsed: ${XposedHelpers.getLongField(statsObj, "mLastTimeUsed")}")
-                                appendLine("mLastTimeVisible: ${XposedHelpers.getLongField(statsObj, "mLastTimeVisible")}")
-                                appendLine("mAppLaunchCount: ${XposedHelpers.getIntField(statsObj, "mAppLaunchCount")}")
-                                appendLine("mBeginTimeStamp: ${XposedHelpers.getLongField(statsObj, "mBeginTimeStamp")}")
-                                appendLine("mEndTimeStamp: ${XposedHelpers.getLongField(statsObj, "mEndTimeStamp")}")
-                                appendLine("Successfully applied mode $mode to summary statistics for: $pkgName")
-                            }
-                            XposedBridge.log(logMsg)
-                            val ctx = AndroidAppHelper.currentApplication()
-                            if (ctx != null) LogWriter.log(ctx, "SUMMARY", logMsg)
+                        } catch (e: Exception) {
+                            log("ERROR", "queryUsageStats capture failed: ${e.message}")
                         }
                     }
                 }
             )
 
             // =================================================================
-            // 2. HOOK: Timeline Events (queryEvents)
+            // 2. TIMELINE EVENT DECODER (queryEvents)
             // =================================================================
             XposedHelpers.findAndHookMethod(
                 usageStatsManagerClass,
                 "queryEvents",
-                Long::class.javaPrimitiveType, // beginTime
-                Long::class.javaPrimitiveType, // endTime
+                Long::class.javaPrimitiveType,
+                Long::class.javaPrimitiveType,
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         try {
-                            // Check if spoofer is enabled
-                            val isEnabled = getRemoteConfig("", "spoofer_enabled")
-                            if (isEnabled == "false") return
-
-                            val queryBeginTime = param.args[0] as Long
-                            val queryEndTime = param.args[1] as Long
+                            val queryBeginTime = param.args[0] as? Long ?: return
+                            val queryEndTime = param.args[1] as? Long ?: return
                             val usageEvents = param.result as? UsageEvents ?: return
 
-                            // Get config for target package
-                            val targetPkg = getRemoteConfig("", "target_package_to_spoof")
-                            if (targetPkg.isEmpty()) return
-
-                            val savedTimeMsStr = getRemoteConfig("", "time")
-                            val modeStr = getRemoteConfig("", "mode")
-
-                            val inputDurationMs = savedTimeMsStr.toLongOrNull() ?: 360000L
-                            val mode = modeStr.toIntOrNull() ?: 0
-
-                            // Dynamically scan UsageEvents fields to find the event container
-                            // (field names vary across OEM ROMs and Android versions)
                             val eventContainer = findEventContainer(usageEvents)
                             if (eventContainer == null) {
-                                XposedBridge.log("[GodMode] Could not find event container in UsageEvents")
+                                log("ERROR", "Could not find event container in UsageEvents")
                                 return
                             }
 
-                            when (mode) {
-                                2 -> { // HIDE mode: remove all events for target package
-                                    eventContainer.removeAll { event ->
-                                        val pkg = XposedHelpers.getObjectField(event, "mPackage") as? String
-                                        pkg == targetPkg
+                            val capture = buildString {
+                                appendLine("╔══════════════════════════════════════════════════════════════╗")
+                                appendLine("║          TIMELINE CAPTURE — queryEvents                      ║")
+                                appendLine("╠══════════════════════════════════════════════════════════════╣")
+                                appendLine("║ Capture Time: ${formatTimestamp(System.currentTimeMillis())}")
+                                appendLine("║ Query Window: ${formatTimestamp(queryBeginTime)}")
+                                appendLine("║ Query End:   ${formatTimestamp(queryEndTime)}")
+                                appendLine("║ Total Events: ${eventContainer.size}")
+                                appendLine("╚════════════════════════════════════════════════════════════════╝")
+                            }
+                            log("TIMELINE", capture)
+
+                            for ((index, event) in eventContainer.withIndex()) {
+                                try {
+                                    val pkg = XposedHelpers.getObjectField(event, "mPackage") as? String ?: "?"
+                                    val cls = XposedHelpers.getObjectField(event, "mClass") as? String ?: "?"
+                                    val type = XposedHelpers.getIntField(event, "mEventType")
+                                    val timestamp = XposedHelpers.getLongField(event, "mTimeStamp")
+
+                                    val entry = buildString {
+                                        appendLine("┌─ Event[$index]")
+                                        appendLine("│  mPackage:    $pkg")
+                                        appendLine("│  mClass:      $cls")
+                                        appendLine("│  mEventType:  $type (${decodeEventType(type)})")
+                                        appendLine("│  mTimeStamp:  ${formatTimestamp(timestamp)}")
+                                        appendLine("└────────────────────────────────────────────────────────────")
                                     }
-                                    XposedBridge.log("[GodMode] HIDE mode: cleared events for $targetPkg")
-                                }
-                                else -> { // SET or ADD mode: inject realistic event sequence
-                                    val eventClass = XposedHelpers.findClass(
-                                        "android.app.usage.UsageEvents\$Event",
-                                        usageEvents.javaClass.classLoader
-                                    )
-
-                                    val maxAvailableWindow = queryEndTime - queryBeginTime
-                                    var durationMs = inputDurationMs
-                                    if (mode == 0 && durationMs > maxAvailableWindow) {
-                                        durationMs = maxAvailableWindow - 5000L
-                                    }
-
-                                    // READ shared timestamps from summary hook — no separate calculation
-                                    val foregroundTime = UsageStatsSpoofer.sessionStart
-                                    val backgroundTime = UsageStatsSpoofer.sessionEnd
-                                    val className = "$targetPkg.MainActivity"
-
-                                    val injectedEvents = mutableListOf<Any>()
-
-                                    // 1. Screen turns on
-                                    val eventScreenOn = eventClass.newInstance()
-                                    XposedHelpers.setObjectField(eventScreenOn, "mPackage", "android")
-                                    XposedHelpers.setLongField(eventScreenOn, "mTimeStamp", foregroundTime)
-                                    XposedHelpers.setIntField(eventScreenOn, "mEventType", 13) // SCREEN_INTERACTIVE
-                                    injectedEvents.add(eventScreenOn)
-
-                                    // 2. App moves to foreground
-                                    val eventForeground = eventClass.newInstance()
-                                    XposedHelpers.setObjectField(eventForeground, "mPackage", targetPkg)
-                                    XposedHelpers.setObjectField(eventForeground, "mClass", className)
-                                    XposedHelpers.setLongField(eventForeground, "mTimeStamp", foregroundTime + 500L)
-                                    XposedHelpers.setIntField(eventForeground, "mEventType", 1) // ACTIVITY_RESUMED
-                                    injectedEvents.add(eventForeground)
-
-                                    // 3. User interaction events every 5-10 seconds
-                                    var currentTime = foregroundTime + 5000L
-                                    val random = java.util.Random()
-                                    while (currentTime < backgroundTime - 5000L) {
-                                        val eventTouch = eventClass.newInstance()
-                                        XposedHelpers.setObjectField(eventTouch, "mPackage", targetPkg)
-                                        XposedHelpers.setObjectField(eventTouch, "mClass", className)
-                                        XposedHelpers.setLongField(eventTouch, "mTimeStamp", currentTime)
-                                        XposedHelpers.setIntField(eventTouch, "mEventType", 7) // USER_INTERACTION
-                                        injectedEvents.add(eventTouch)
-                                        currentTime += 5000L + random.nextInt(5000)
-                                    }
-
-                                    // 4. Configuration change (screen rotation, etc.)
-                                    if (durationMs > 30000) {
-                                        val eventConfig = eventClass.newInstance()
-                                        XposedHelpers.setObjectField(eventConfig, "mPackage", targetPkg)
-                                        XposedHelpers.setObjectField(eventConfig, "mClass", className)
-                                        XposedHelpers.setLongField(eventConfig, "mTimeStamp", foregroundTime + durationMs / 2)
-                                        XposedHelpers.setIntField(eventConfig, "mEventType", 5) // CONFIGURATION_CHANGE
-                                        injectedEvents.add(eventConfig)
-                                    }
-
-                                    // 5. App moves to background
-                                    val eventBackground = eventClass.newInstance()
-                                    XposedHelpers.setObjectField(eventBackground, "mPackage", targetPkg)
-                                    XposedHelpers.setObjectField(eventBackground, "mClass", className)
-                                    XposedHelpers.setLongField(eventBackground, "mTimeStamp", backgroundTime)
-                                    XposedHelpers.setIntField(eventBackground, "mEventType", 2) // ACTIVITY_PAUSED
-                                    injectedEvents.add(eventBackground)
-
-                                    // 6. Screen turns off
-                                    val eventScreenOff = eventClass.newInstance()
-                                    XposedHelpers.setObjectField(eventScreenOff, "mPackage", "android")
-                                    XposedHelpers.setLongField(eventScreenOff, "mTimeStamp", backgroundTime + 500L)
-                                    XposedHelpers.setIntField(eventScreenOff, "mEventType", 14) // SCREEN_NON_INTERACTIVE
-                                    injectedEvents.add(eventScreenOff)
-
-                                    // Sort by timestamp and inject
-                                    injectedEvents.sortBy { XposedHelpers.getLongField(it, "mTimeStamp") }
-                                    eventContainer.addAll(injectedEvents)
-
-                                    // Timeline audit log
-                                    val timelineLog = buildString {
-                                        appendLine("=== TIMELINE AUDIT for $targetPkg ===")
-                                        for ((index, event) in injectedEvents.withIndex()) {
-                                            val pkg = XposedHelpers.getObjectField(event, "mPackage") as? String ?: "?"
-                                            val ts = XposedHelpers.getLongField(event, "mTimeStamp")
-                                            val type = XposedHelpers.getIntField(event, "mEventType")
-                                            appendLine("Event[$index]: pkg=$pkg, type=$type, timestamp=$ts")
-                                        }
-                                        appendLine("Injected ${injectedEvents.size} events for $targetPkg (${durationMs}ms)")
-                                    }
-                                    XposedBridge.log(timelineLog)
-                                    val ctx = AndroidAppHelper.currentApplication()
-                                    if (ctx != null) LogWriter.log(ctx, "TIMELINE", timelineLog)
+                                    log("TIMELINE", entry)
+                                } catch (e: Exception) {
+                                    log("ERROR", "Failed to decode event[$index]: ${e.message}")
                                 }
                             }
                         } catch (e: Exception) {
-                            XposedBridge.log("[GodMode] queryEvents hook error: ${e.message}")
+                            log("ERROR", "queryEvents capture failed: ${e.message}")
                         }
                     }
                 }
             )
 
         } catch (e: Exception) {
-            XposedBridge.log("[GodMode] Critical Initialization Defect: ${e.message}")
+            log("ERROR", "Critical initialization failure: ${e.message}")
         }
     }
 }
