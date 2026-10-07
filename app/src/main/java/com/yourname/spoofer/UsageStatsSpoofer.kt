@@ -12,12 +12,17 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
 import java.lang.reflect.Constructor
 
 /**
- * Unified UsageStats Spoofer — creates a complete, internally-consistent
- * usage profile identical to what a real app would produce.
+ * Unified UsageStats Spoofer.
  *
- * The event timeline shows multiple realistic sessions building up over time.
- * The summary metrics (total time, launch count, last used) are derived from
- * the exact same session data, so all three query pathways always agree.
+ * Architecture: Events are the source of truth. Summary metrics are DERIVED
+ * from the event timeline, exactly like a real app. This guarantees the
+ * summary and timeline can never contradict each other.
+ *
+ * Flow:
+ *   1. Build realistic multi-session event timeline
+ *   2. Derive summary from events (total time, launch count, last used)
+ *   3. Inject events into queryEvents
+ *   4. Inject derived summary into queryUsageStats / queryAndAggregateUsageStats
  */
 class UsageStatsSpoofer : IXposedHookLoadPackage {
 
@@ -52,8 +57,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
     @Volatile private var cachedBeginTime = 0L
     @Volatile private var cachedEndTime = 0L
     @Volatile private var cachedLastUsedTime = 0L
-    @Volatile private var cachedSessionStartTime = 0L
-    @Volatile private var cachedSessionEndTime = 0L
     @Volatile private var cachedTargetPackage: String? = null
     @Volatile private var cachedLaunchCount = 0
 
@@ -71,8 +74,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         val mode: Int,
         val queryBeginTime: Long,
         val queryEndTime: Long,
-        val sessionStartTime: Long,
-        val sessionEndTime: Long,
         val durationMs: Long,
         val lastUsedTime: Long,
         val launchCount: Int,
@@ -469,7 +470,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         }
         register(usageStatsManagerClass, eventsForPackageHook, "queryEventsForPackage", arrayOf(stringClass, longClass, longClass), 1)
 
-        // ---- fallback: queryEventsForUser -----------------------------------
         val eventsForUserHook = object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
                 try {
@@ -483,21 +483,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
             }
         }
         register(usageStatsManagerClass, eventsForUserHook, "queryEventsForUser", arrayOf(longClass, longClass, Int::class.javaPrimitiveType!!), 1)
-
-        // ---- fallback: queryConfigurations -----------------------------------
-        val configHook = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) {
-                try {
-                    val begin = param.args.longAt(0)
-                    val end = param.args.longAt(1)
-                    if (begin == null || end == null) return
-                    applyTimeline(param.result, begin, end)
-                } catch (t: Throwable) {
-                    logError("queryConfigurations hook failure: ${t.message}")
-                }
-            }
-        }
-        register(usageStatsManagerClass, configHook, "queryConfigurations", arrayOf(longClass, longClass), 0)
 
         reportCoverage(usageStatsManagerClass)
     }
@@ -550,8 +535,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
 
     private fun ensureLocked(
         queryBeginTime: Long,
-        queryEndTime: Long,
-        realForegroundMs: Long = 0L
+        queryEndTime: Long
     ): SessionSnapshot? {
         synchronized(stateLock) {
             if (isSessionLocked && queryEndTime < cachedEndTime - CACHE_RESET_THRESHOLD_MS) {
@@ -568,8 +552,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                     mode = MODE_SET,
                     queryBeginTime = cachedBeginTime,
                     queryEndTime = cachedEndTime,
-                    sessionStartTime = cachedSessionStartTime,
-                    sessionEndTime = cachedSessionEndTime,
                     durationMs = cachedDurationMs,
                     lastUsedTime = cachedLastUsedTime,
                     launchCount = cachedLaunchCount,
@@ -585,8 +567,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                     mode = MODE_HIDE,
                     queryBeginTime = queryBeginTime,
                     queryEndTime = queryEndTime,
-                    sessionStartTime = 0L,
-                    sessionEndTime = 0L,
                     durationMs = 0L,
                     lastUsedTime = 0L,
                     launchCount = 0,
@@ -594,64 +574,62 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 )
             }
 
+            // Step 1: Build event timeline FIRST (source of truth)
             val fakeLastUsedTime = queryEndTime - TAIL_ANCHOR_MS
-            val durationMs = if (config.mode == MODE_ADD) {
-                realForegroundMs + config.targetDurationMs
-            } else {
-                config.targetDurationMs
-            }
             val sessionEndTime = fakeLastUsedTime
-            val sessionStartTime = (sessionEndTime - durationMs).coerceAtLeast(queryBeginTime)
+            val sessionStartTime = (sessionEndTime - config.targetDurationMs).coerceAtLeast(queryBeginTime)
 
-            val events = buildRealisticSessions(config.targetPackage, sessionStartTime, sessionEndTime, durationMs)
-            val launchCount = events.count { it.type == EVENT_MOVE_TO_FOREGROUND }
+            val events = buildRealisticSessions(config.targetPackage, sessionStartTime, sessionEndTime)
 
-            cachedDurationMs = durationMs
+            // Step 2: Derive summary FROM events (guarantees consistency)
+            val derivedDurationMs = deriveDurationFromEvents(events)
+            val derivedLaunchCount = events.count { it.type == EVENT_MOVE_TO_FOREGROUND }
+            val derivedLastUsedTime = events.lastOrNull { it.type == EVENT_MOVE_TO_BACKGROUND }?.timestamp ?: fakeLastUsedTime
+
+            // Step 3: Cache everything
+            cachedDurationMs = derivedDurationMs
             cachedBeginTime = queryBeginTime
             cachedEndTime = queryEndTime
-            cachedLastUsedTime = fakeLastUsedTime
-            cachedSessionStartTime = sessionStartTime
-            cachedSessionEndTime = sessionEndTime
+            cachedLastUsedTime = derivedLastUsedTime
             cachedTargetPackage = config.targetPackage
-            cachedLaunchCount = launchCount
+            cachedLaunchCount = derivedLaunchCount
             cachedSyntheticEvents.clear()
             cachedSyntheticEvents.addAll(events)
             isSessionLocked = true
 
             log("[State-Machine] Telemetry profile initialized and locked for package: ${config.targetPackage}")
+            log("[State-Machine] Derived from events: duration=${derivedDurationMs}ms launches=$derivedLaunchCount lastUsed=$derivedLastUsedTime")
 
             return SessionSnapshot(
                 targetPackage = config.targetPackage,
                 mode = config.mode,
                 queryBeginTime = queryBeginTime,
                 queryEndTime = queryEndTime,
-                sessionStartTime = sessionStartTime,
-                sessionEndTime = sessionEndTime,
-                durationMs = durationMs,
-                lastUsedTime = fakeLastUsedTime,
-                launchCount = launchCount,
+                durationMs = derivedDurationMs,
+                lastUsedTime = derivedLastUsedTime,
+                launchCount = derivedLaunchCount,
                 events = events
             )
         }
     }
 
     /**
-     * Builds a realistic multi-session timeline that looks like a real app.
-     * Each session: MOVE_TO_FOREGROUND -> USER_INTERACTION(s) -> MOVE_TO_BACKGROUND
-     * Sessions are distributed across the time window with natural gaps.
+     * Builds a realistic multi-session event timeline.
+     * Sessions are contiguous (no gaps) so the total event span equals the summary duration.
      */
     private fun buildRealisticSessions(
         packageName: String,
         sessionStartTime: Long,
-        sessionEndTime: Long,
-        totalDurationMs: Long
+        sessionEndTime: Long
     ): List<CachedEvent> {
         val events = mutableListOf<CachedEvent>()
         val windowMs = sessionEndTime - sessionStartTime
 
-        if (windowMs <= 0 || totalDurationMs <= 0) return events
+        if (windowMs <= 0) return events
 
-        // Determine number of sessions — contiguous (no gaps) so event span == summary duration
+        val totalDurationMs = windowMs
+
+        // Determine number of sessions
         val sessionCount = when {
             totalDurationMs < 60_000 -> 2
             totalDurationMs < 300_000 -> 3
@@ -663,7 +641,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
 
         for (i in 0 until sessionCount) {
             val sessionEnd = if (i == sessionCount - 1) {
-                sessionEndTime // Last session ends exactly at sessionEndTime
+                sessionEndTime
             } else {
                 currentTime + sessionDuration
             }
@@ -690,6 +668,29 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         }
 
         return events
+    }
+
+    /**
+     * Derives total foreground duration from the event timeline.
+     * Sums (MOVE_TO_BACKGROUND - MOVE_TO_FOREGROUND) for each session.
+     */
+    private fun deriveDurationFromEvents(events: List<CachedEvent>): Long {
+        var total = 0L
+        var foregroundTime = 0L
+
+        for (event in events) {
+            when (event.type) {
+                EVENT_MOVE_TO_FOREGROUND -> foregroundTime = event.timestamp
+                EVENT_MOVE_TO_BACKGROUND -> {
+                    if (foregroundTime > 0) {
+                        total += (event.timestamp - foregroundTime)
+                        foregroundTime = 0
+                    }
+                }
+            }
+        }
+
+        return total
     }
 
     // ============================================================ hook application
@@ -719,7 +720,8 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                     } else {
                         val created = createUsageStats(targetPackage) ?: return
                         if (result is MutableList<*>) {
-                            result.add(created)
+                            @Suppress("UNCHECKED_CAST")
+                            (result as MutableList<Any>).add(created)
                             log("[State-Machine] $kind: created new row for $targetPackage")
                         }
                         created
@@ -735,7 +737,8 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                     } else {
                         val created = createUsageStats(targetPackage) ?: return
                         if (result is MutableMap<*, *>) {
-                            result[targetPackage] = created
+                            @Suppress("UNCHECKED_CAST")
+                            (result as MutableMap<Any, Any>)[targetPackage] = created
                             log("[State-Machine] $kind: created new entry for $targetPackage")
                         }
                         created
@@ -744,13 +747,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 else -> return
             }
 
-            val realForegroundMs = if (!isSessionLocked) {
-                getLongField(targetEntry, "mTotalTimeInForeground")
-            } else {
-                0L
-            }
-
-            val snapshot = ensureLocked(queryBeginTime, queryEndTime, realForegroundMs) ?: return
+            val snapshot = ensureLocked(queryBeginTime, queryEndTime) ?: return
 
             if (snapshot.mode == MODE_HIDE) {
                 var removed = false
@@ -794,6 +791,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 "[State-Machine] $kind injected $targetPackage " +
                     "wrote=${snapshot.durationMs}ms " +
                     "readBack=${verified}ms " +
+                    "launches=${snapshot.launchCount} " +
                     "window=${snapshot.queryEndTime - snapshot.queryBeginTime}ms"
             )
         } catch (t: Throwable) {
@@ -844,16 +842,14 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 "[State-Machine] TIMELINE injected ${snapshot.targetPackage} " +
                     "removed=$removedCount injected=${injected.size} " +
                     "total=${container.size} " +
-                    "span=${snapshot.sessionEndTime - snapshot.sessionStartTime}ms"
+                    "span=${snapshot.durationMs}ms " +
+                    "launches=${snapshot.launchCount}"
             )
         } catch (t: Throwable) {
             logError("queryEvents hook failure: ${t.message}")
         }
     }
 
-    /**
-     * Creates a synthetic UsageStats object for the target package.
-     */
     private fun createUsageStats(packageName: String): Any? {
         return try {
             val usageStatsClass = XposedHelpers.findClass(
