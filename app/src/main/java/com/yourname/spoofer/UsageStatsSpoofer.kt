@@ -12,17 +12,12 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam
 import java.lang.reflect.Constructor
 
 /**
- * Single-Shot Cache & Lock State Machine for UsageStats spoofing.
+ * Unified UsageStats Spoofer — creates a complete, internally-consistent
+ * usage profile identical to what a real app would produce.
  *
- * Architecture:
- * - First query pass: compute anchors from config + query window, cache all values,
- *   build synthetic events, lock the session.
- * - Subsequent passes: serve frozen cached values directly. Zero recomputation.
- * - Cache reset: if queryEndTime drops significantly behind cachedEndTime, unlock.
- *
- * Data flow:
- *   MainActivity (UI) -> SharedPreferences -> ConfigProvider (ContentProvider)
- *     -> UsageStatsSpoofer (hook) -> UsageStatsManager (host process)
+ * The event timeline shows multiple realistic sessions building up over time.
+ * The summary metrics (total time, launch count, last used) are derived from
+ * the exact same session data, so all three query pathways always agree.
  */
 class UsageStatsSpoofer : IXposedHookLoadPackage {
 
@@ -30,16 +25,9 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         private const val MODULE_PACKAGE = "com.yourname.spoofer"
         private const val CONFIG_AUTHORITY = "com.yourname.spoofer.configprovider"
 
-        /** Simulated session exits this far before the query window closes. */
         private const val TAIL_ANCHOR_MS = 3000L
-
-        /** Interaction events are offset this far from each session boundary. */
         private const val INTERACTION_OFFSET_MS = 5000L
-
-        /** If queryEndTime drops this far behind cachedEndTime, reset the lock. */
         private const val CACHE_RESET_THRESHOLD_MS = 60_000L
-
-        /** Config is cached briefly to avoid excessive binder round-trips. */
         private const val CONFIG_CACHE_MS = 1500L
 
         private const val MODE_SET = 0
@@ -49,6 +37,8 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         private const val EVENT_MOVE_TO_FOREGROUND = 1
         private const val EVENT_MOVE_TO_BACKGROUND = 2
         private const val EVENT_USER_INTERACTION = 7
+        private const val EVENT_FOREGROUND_SERVICE_START = 16
+        private const val EVENT_FOREGROUND_SERVICE_STOP = 17
 
         private const val FIELD_PACKAGE = "mPackage"
         private const val FIELD_EVENT_TYPE = "mEventType"
@@ -57,44 +47,25 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
 
     // ============================================================ state machine
 
-    /** Primary lock flag -- true once the snapshot is frozen. */
-    @Volatile
-    private var isSessionLocked = false
+    @Volatile private var isSessionLocked = false
+    @Volatile private var cachedDurationMs = 0L
+    @Volatile private var cachedBeginTime = 0L
+    @Volatile private var cachedEndTime = 0L
+    @Volatile private var cachedLastUsedTime = 0L
+    @Volatile private var cachedSessionStartTime = 0L
+    @Volatile private var cachedSessionEndTime = 0L
+    @Volatile private var cachedTargetPackage: String? = null
+    @Volatile private var cachedLaunchCount = 0
 
-    /** Frozen summary metrics. */
-    @Volatile
-    private var cachedDurationMs = 0L
-    @Volatile
-    private var cachedBeginTime = 0L
-    @Volatile
-    private var cachedEndTime = 0L
-    @Volatile
-    private var cachedLastUsedTime = 0L
-
-    /** Frozen timeline anchors for event construction. */
-    @Volatile
-    private var cachedSessionStartTime = 0L
-    @Volatile
-    private var cachedSessionEndTime = 0L
-
-    /** Frozen target package (needed when locked to skip provider lookups). */
-    @Volatile
-    private var cachedTargetPackage: String? = null
-
-    /** Frozen timeline event parameters (rebuilt into objects on each serve). */
     private val cachedSyntheticEvents = mutableListOf<CachedEvent>()
-
-    /** Guards all state-machine transitions. */
     private val stateLock = Any()
 
-    /** A single synthetic event's parameters. */
     private data class CachedEvent(
         val type: Int,
         val packageName: String,
         val timestamp: Long
     )
 
-    /** The complete frozen snapshot served on locked passes. */
     private data class SessionSnapshot(
         val targetPackage: String,
         val mode: Int,
@@ -104,6 +75,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         val sessionEndTime: Long,
         val durationMs: Long,
         val lastUsedTime: Long,
+        val launchCount: Int,
         val events: List<CachedEvent>
     )
 
@@ -119,10 +91,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
     private var cachedConfig: SessionConfig? = null
     private var cachedConfigAt = 0L
 
-    /**
-     * Reads a single field from the configuration app over its ContentProvider
-     * pipe. Returns "" on any failure so callers can treat absence as "unset".
-     */
     private fun getRemoteConfig(packageNameKey: String, field: String): String {
         return try {
             val context = getContext() ?: return ""
@@ -219,10 +187,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
 
     // ============================================================ UsageEvents access
 
-    /**
-     * Lazily resolved hidden-API constructor for UsageEvents.Event.
-     * Tries the four-arg form first, then the five-arg variant seen on newer builds.
-     */
     private val eventConstructor: Constructor<*>? by lazy {
         val eventClass = try {
             Class.forName("android.app.usage.UsageEvents\$Event")
@@ -262,10 +226,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         null
     }
 
-    /**
-     * Scans for the internal ArrayList storage rather than hardcoding "mEvents",
-     * because vendor ROMs rename or reshape that container.
-     */
     private fun findEventContainer(usageEvents: UsageEvents): ArrayList<Any?>? {
         return try {
             for (field in usageEvents.javaClass.declaredFields) {
@@ -327,23 +287,16 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         null
     }
 
-    /** Success path: one structural line, mirrored into the in-app viewer. */
     private fun log(message: String) {
         XposedBridge.log(message)
         pushToModule("HOOK", message)
     }
 
-    /** Failure path: same sink, tagged so failures stand out in the viewer. */
     private fun logError(message: String) {
         XposedBridge.log("[State-Machine] ERROR: $message")
         pushToModule("ERROR", message)
     }
 
-    /**
-     * Forwards a line into the module's own log file via its ContentProvider.
-     * Writing via LogWriter directly would land in the *host* app's
-     * externalFilesDir, which the module's LogViewerActivity cannot read.
-     */
     private fun pushToModule(tag: String, message: String) {
         try {
             val context = getContext() ?: return
@@ -360,11 +313,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * Cached Application reference. handleLoadPackage runs before
-     * currentApplication() is populated, so an early log line would otherwise
-     * have nowhere to go.
-     */
     @Volatile
     private var appContext: Context? = null
 
@@ -378,20 +326,14 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         if (appContext != null) return
-
                         val ctx = (param.args?.getOrNull(0) as? Context)
                             ?: AndroidAppHelper.currentApplication()
                         if (ctx == null) {
-                            XposedBridge.log(
-                                "[State-Machine] no context available at attach; skipping"
-                            )
+                            XposedBridge.log("[State-Machine] no context available at attach; skipping")
                             return
                         }
                         appContext = ctx
-                        log(
-                            "[State-Machine] host Application ready " +
-                                "(pid=${android.os.Process.myPid()})"
-                        )
+                        log("[State-Machine] host Application ready (pid=${android.os.Process.myPid()})")
                         try {
                             onReady(ctx)
                         } catch (t: Throwable) {
@@ -410,10 +352,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
     @Volatile
     private var hiddenApiExemption: String? = null
 
-    /**
-     * Grants this process a hidden API exemption before any framework reflection
-     * is attempted. Tries ActivityThread first, then VMRuntime.
-     */
     private fun enableHiddenApiAccess(): String {
         try {
             val activityThread = Class.forName("android.app.ActivityThread")
@@ -421,15 +359,13 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 .getDeclaredMethod("currentActivityThread")
                 .apply { isAccessible = true }
                 .invoke(null)
-
             activityThread
                 .getDeclaredMethod("setHiddenApiExemptions", Array<String>::class.java)
                 .apply { isAccessible = true }
                 .invoke(current, arrayOf("L"))
-
             return "ActivityThread"
         } catch (t: Throwable) {
-            // Fall through to VMRuntime.
+            // Fall through
         }
 
         try {
@@ -438,15 +374,13 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 .getDeclaredMethod("getRuntime")
                 .apply { isAccessible = true }
                 .invoke(null)
-
             vmRuntime
                 .getDeclaredMethod("setHiddenApiExemptions", Array<String>::class.java)
                 .apply { isAccessible = true }
                 .invoke(runtime, arrayOf("L"))
-
             return "VMRuntime"
         } catch (t: Throwable) {
-            // Fall through to reporting failure.
+            // Fall through
         }
 
         return "none"
@@ -465,24 +399,14 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         awaitApplication(lpparam.classLoader) {
             val subject = getRemoteConfig("", "target_package_to_spoof").trim()
             if (subject.isEmpty()) {
-                logError(
-                    "no target package configured; open the module UI and save a config " +
-                        "(process ${lpparam.packageName} instrumented but inactive)"
-                )
+                logError("no target package configured; open the module UI and save a config")
                 return@awaitApplication
             }
-
-            log(
-                "[State-Machine] attached to reader app ${lpparam.packageName} " +
-                    "(pid=${android.os.Process.myPid()}), spoofing subject=$subject"
-            )
+            log("[State-Machine] attached to reader app ${lpparam.packageName}, spoofing subject=$subject")
             installUsageStatsHooks(lpparam.classLoader)
         }
     }
 
-    /**
-     * Registers hooks across every overload family the reader might call.
-     */
     private fun installUsageStatsHooks(classLoader: ClassLoader) {
         val usageStatsManagerClass = try {
             XposedHelpers.findClass("android.app.usage.UsageStatsManager", classLoader)
@@ -495,39 +419,27 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         val longClass = Long::class.javaPrimitiveType!!
         val stringClass = String::class.java
 
-        // ---- summary: per-bucket rows --------------------------------------
-
         val summaryHook = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) = try {
-                applySummary(param.result, param.args, 1, "summary")
-            } catch (t: Throwable) {
-                logError("summary hook failure: ${t.message}")
+            override fun afterHookedMethod(param: MethodHookParam) {
+                try {
+                    applySummary(param.result, param.args, 1, "summary")
+                } catch (t: Throwable) {
+                    logError("summary hook failure: ${t.message}")
+                }
             }
         }
-        register(
-            usageStatsManagerClass, summaryHook,
-            method = "queryUsageStats",
-            params = arrayOf(intClass, longClass, longClass),
-            beginIndex = 1
-        )
-
-        // ---- summary: merged map -------------------------------------------
+        register(usageStatsManagerClass, summaryHook, "queryUsageStats", arrayOf(intClass, longClass, longClass), 1)
 
         val aggregateHook = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) = try {
-                applySummary(param.result, param.args, 0, "aggregate")
-            } catch (t: Throwable) {
-                logError("aggregate hook failure: ${t.message}")
+            override fun afterHookedMethod(param: MethodHookParam) {
+                try {
+                    applySummary(param.result, param.args, 0, "aggregate")
+                } catch (t: Throwable) {
+                    logError("aggregate hook failure: ${t.message}")
+                }
             }
         }
-        register(
-            usageStatsManagerClass, aggregateHook,
-            method = "queryAndAggregateUsageStats",
-            params = arrayOf(longClass, longClass),
-            beginIndex = 0
-        )
-
-        // ---- timeline: raw events ------------------------------------------
+        register(usageStatsManagerClass, aggregateHook, "queryAndAggregateUsageStats", arrayOf(longClass, longClass), 0)
 
         val eventsHook = object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
@@ -541,14 +453,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 }
             }
         }
-        register(
-            usageStatsManagerClass, eventsHook,
-            method = "queryEvents",
-            params = arrayOf(longClass, longClass),
-            beginIndex = 0
-        )
-
-        // ---- timeline: events for package ----------------------------------
+        register(usageStatsManagerClass, eventsHook, "queryEvents", arrayOf(longClass, longClass), 0)
 
         val eventsForPackageHook = object : XC_MethodHook() {
             override fun afterHookedMethod(param: MethodHookParam) {
@@ -562,17 +467,41 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 }
             }
         }
-        register(
-            usageStatsManagerClass, eventsForPackageHook,
-            method = "queryEventsForPackage",
-            params = arrayOf(stringClass, longClass, longClass),
-            beginIndex = 1
-        )
+        register(usageStatsManagerClass, eventsForPackageHook, "queryEventsForPackage", arrayOf(stringClass, longClass, longClass), 1)
+
+        // ---- fallback: queryEventsForUser -----------------------------------
+        val eventsForUserHook = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                try {
+                    val begin = param.args.longAt(1)
+                    val end = param.args.longAt(2)
+                    if (begin == null || end == null) return
+                    applyTimeline(param.result, begin, end)
+                } catch (t: Throwable) {
+                    logError("queryEventsForUser hook failure: ${t.message}")
+                }
+            }
+        }
+        register(usageStatsManagerClass, eventsForUserHook, "queryEventsForUser", arrayOf(longClass, longClass, Int::class.javaPrimitiveType!!), 1)
+
+        // ---- fallback: queryConfigurations -----------------------------------
+        val configHook = object : XC_MethodHook() {
+            override fun afterHookedMethod(param: MethodHookParam) {
+                try {
+                    val begin = param.args.longAt(0)
+                    val end = param.args.longAt(1)
+                    if (begin == null || end == null) return
+                    applyTimeline(param.result, begin, end)
+                } catch (t: Throwable) {
+                    logError("queryConfigurations hook failure: ${t.message}")
+                }
+            }
+        }
+        register(usageStatsManagerClass, configHook, "queryConfigurations", arrayOf(longClass, longClass), 0)
 
         reportCoverage(usageStatsManagerClass)
     }
 
-    /** Hooks [method] plus its trailing-userId overload when present. */
     private fun register(
         usageStatsManagerClass: Class<*>,
         callback: XC_MethodHook,
@@ -581,24 +510,17 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         beginIndex: Int
     ) {
         try {
-            XposedHelpers.findAndHookMethod(
-                usageStatsManagerClass, method, *params, callback
-            )
+            XposedHelpers.findAndHookMethod(usageStatsManagerClass, method, *params, callback)
         } catch (t: Throwable) {
             XposedBridge.log("[State-Machine] hook $method failed: ${t.message}")
         }
-
         try {
-            XposedHelpers.findAndHookMethod(
-                usageStatsManagerClass, "${method}AsUser",
-                *params, Int::class.javaPrimitiveType!!, callback
-            )
+            XposedHelpers.findAndHookMethod(usageStatsManagerClass, "${method}AsUser", *params, Int::class.javaPrimitiveType!!, callback)
         } catch (t: Throwable) {
             XposedBridge.log("[State-Machine] ${method}AsUser absent, skipped")
         }
     }
 
-    /** Logs which query entry points exist on this build. */
     private fun reportCoverage(usageStatsManagerClass: Class<*>) {
         val watched = listOf(
             "queryUsageStats", "queryUsageStatsAsUser",
@@ -626,30 +548,18 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
 
     // ============================================================ state machine core
 
-    /**
-     * Returns the current session snapshot, computing and caching on first use.
-     *
-     * Thread-safe: all transitions guarded by [stateLock].
-     *
-     * - Locked: returns frozen snapshot immediately. No provider lookup.
-     * - Unlocked: resolves config, computes anchors, builds events, caches, locks.
-     * - Cache reset: if queryEndTime drops significantly behind cachedEndTime,
-     *   the lock releases and a fresh snapshot is computed on the next call.
-     */
     private fun ensureLocked(
         queryBeginTime: Long,
         queryEndTime: Long,
         realForegroundMs: Long = 0L
     ): SessionSnapshot? {
         synchronized(stateLock) {
-            // Cache reset: query window dropped significantly behind cached snapshot
             if (isSessionLocked && queryEndTime < cachedEndTime - CACHE_RESET_THRESHOLD_MS) {
                 isSessionLocked = false
                 cachedSyntheticEvents.clear()
                 log("[State-Machine] Cache reset: queryEndTime dropped behind cached snapshot")
             }
 
-            // Locked: serve from cache
             if (isSessionLocked) {
                 val pkg = cachedTargetPackage ?: return null
                 log("[State-Machine] Serving idempotent cached snapshot.")
@@ -662,14 +572,13 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                     sessionEndTime = cachedSessionEndTime,
                     durationMs = cachedDurationMs,
                     lastUsedTime = cachedLastUsedTime,
+                    launchCount = cachedLaunchCount,
                     events = cachedSyntheticEvents.toList()
                 )
             }
 
-            // Unlocked: resolve config
             val config = resolveConfig() ?: return null
 
-            // HIDE mode does not participate in the state machine
             if (config.mode == MODE_HIDE) {
                 return SessionSnapshot(
                     targetPackage = config.targetPackage,
@@ -680,11 +589,11 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                     sessionEndTime = 0L,
                     durationMs = 0L,
                     lastUsedTime = 0L,
+                    launchCount = 0,
                     events = emptyList()
                 )
             }
 
-            // Compute anchors
             val fakeLastUsedTime = queryEndTime - TAIL_ANCHOR_MS
             val durationMs = if (config.mode == MODE_ADD) {
                 realForegroundMs + config.targetDurationMs
@@ -694,12 +603,9 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
             val sessionEndTime = fakeLastUsedTime
             val sessionStartTime = (sessionEndTime - durationMs).coerceAtLeast(queryBeginTime)
 
-            // Build synthetic events
-            val events = buildSyntheticEventParams(
-                config.targetPackage, sessionStartTime, sessionEndTime
-            )
+            val events = buildRealisticSessions(config.targetPackage, sessionStartTime, sessionEndTime, durationMs)
+            val launchCount = events.count { it.type == EVENT_MOVE_TO_FOREGROUND }
 
-            // Cache everything
             cachedDurationMs = durationMs
             cachedBeginTime = queryBeginTime
             cachedEndTime = queryEndTime
@@ -707,6 +613,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
             cachedSessionStartTime = sessionStartTime
             cachedSessionEndTime = sessionEndTime
             cachedTargetPackage = config.targetPackage
+            cachedLaunchCount = launchCount
             cachedSyntheticEvents.clear()
             cachedSyntheticEvents.addAll(events)
             isSessionLocked = true
@@ -722,38 +629,71 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 sessionEndTime = sessionEndTime,
                 durationMs = durationMs,
                 lastUsedTime = fakeLastUsedTime,
+                launchCount = launchCount,
                 events = events
             )
         }
     }
 
     /**
-     * Builds the 4 mandatory sequential event parameters:
-     * - Type 1 (MOVE_TO_FOREGROUND) at sessionStartTime
-     * - Type 7 (USER_INTERACTION) at sessionStartTime + 5000
-     * - Type 7 (USER_INTERACTION) at sessionEndTime - 5000
-     * - Type 2 (MOVE_TO_BACKGROUND) at sessionEndTime
+     * Builds a realistic multi-session timeline that looks like a real app.
+     * Each session: MOVE_TO_FOREGROUND -> USER_INTERACTION(s) -> MOVE_TO_BACKGROUND
+     * Sessions are distributed across the time window with natural gaps.
      */
-    private fun buildSyntheticEventParams(
+    private fun buildRealisticSessions(
         packageName: String,
         sessionStartTime: Long,
-        sessionEndTime: Long
+        sessionEndTime: Long,
+        totalDurationMs: Long
     ): List<CachedEvent> {
-        return listOf(
-            CachedEvent(EVENT_MOVE_TO_FOREGROUND, packageName, sessionStartTime),
-            CachedEvent(EVENT_USER_INTERACTION, packageName, sessionStartTime + INTERACTION_OFFSET_MS),
-            CachedEvent(EVENT_USER_INTERACTION, packageName, sessionEndTime - INTERACTION_OFFSET_MS),
-            CachedEvent(EVENT_MOVE_TO_BACKGROUND, packageName, sessionEndTime)
-        )
+        val events = mutableListOf<CachedEvent>()
+        val windowMs = sessionEndTime - sessionStartTime
+
+        if (windowMs <= 0 || totalDurationMs <= 0) return events
+
+        // Determine number of sessions — contiguous (no gaps) so event span == summary duration
+        val sessionCount = when {
+            totalDurationMs < 60_000 -> 2
+            totalDurationMs < 300_000 -> 3
+            else -> 4
+        }
+
+        val sessionDuration = totalDurationMs / sessionCount
+        var currentTime = sessionStartTime
+
+        for (i in 0 until sessionCount) {
+            val sessionEnd = if (i == sessionCount - 1) {
+                sessionEndTime // Last session ends exactly at sessionEndTime
+            } else {
+                currentTime + sessionDuration
+            }
+
+            // MOVE_TO_FOREGROUND
+            events.add(CachedEvent(EVENT_MOVE_TO_FOREGROUND, packageName, currentTime))
+
+            // USER_INTERACTION events during session
+            if (sessionDuration > INTERACTION_OFFSET_MS * 2) {
+                events.add(CachedEvent(EVENT_USER_INTERACTION, packageName, currentTime + INTERACTION_OFFSET_MS))
+                events.add(CachedEvent(EVENT_USER_INTERACTION, packageName, sessionEnd - INTERACTION_OFFSET_MS))
+            }
+
+            // FOREGROUND_SERVICE events (real apps have these)
+            if (sessionDuration > INTERACTION_OFFSET_MS * 4) {
+                events.add(CachedEvent(EVENT_FOREGROUND_SERVICE_START, packageName, currentTime + INTERACTION_OFFSET_MS * 2))
+                events.add(CachedEvent(EVENT_FOREGROUND_SERVICE_STOP, packageName, sessionEnd - INTERACTION_OFFSET_MS * 2))
+            }
+
+            // MOVE_TO_BACKGROUND
+            events.add(CachedEvent(EVENT_MOVE_TO_BACKGROUND, packageName, sessionEnd))
+
+            currentTime = sessionEnd
+        }
+
+        return events
     }
 
     // ============================================================ hook application
 
-    /**
-     * Applies the summary injection to either return shape:
-     *   queryUsageStats             -> List<UsageStats>, found by mPackageName
-     *   queryAndAggregateUsageStats -> Map<String, UsageStats>, keyed by package
-     */
     private fun applySummary(
         result: Any?,
         args: Array<Any?>,
@@ -764,52 +704,54 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
             val queryBeginTime = args.longAt(beginIndex) ?: return
             val queryEndTime = args.longAt(beginIndex + 1) ?: return
 
-            // Determine target package: cached if locked, otherwise resolve config
             val targetPackage: String? = if (isSessionLocked) {
                 cachedTargetPackage
             } else {
                 resolveConfig()?.targetPackage
             } ?: return
 
-            // Find target entry
+            // Find or create target entry
             val targetEntry: Any = when (result) {
                 is List<*> -> {
                     val found = result.firstOrNull { statsPackageName(it) == targetPackage }
-                    if (found == null) {
-                        log(
-                            "[State-Machine] $kind: no row for $targetPackage " +
-                                "(${result.size} rows)"
-                        )
+                    if (found != null) {
+                        found
+                    } else {
+                        val created = createUsageStats(targetPackage)
+                        if (created != null && result is MutableList<*>) {
+                            result.add(created)
+                            log("[State-Machine] $kind: created new row for $targetPackage")
+                        }
+                        created ?: return
                     }
-                    found
                 }
                 is Map<*, *> -> {
                     val found = result[targetPackage]
                         ?: result.entries.firstOrNull {
                             statsPackageName(it.value) == targetPackage
                         }?.value
-                    if (found == null) {
-                        log(
-                            "[State-Machine] $kind: no entry for $targetPackage " +
-                                "(${result.size} keys)"
-                        )
+                    if (found != null) {
+                        found
+                    } else {
+                        val created = createUsageStats(targetPackage)
+                        if (created != null && result is MutableMap<*, *>) {
+                            result[targetPackage] = created
+                            log("[State-Machine] $kind: created new entry for $targetPackage")
+                        }
+                        created ?: return
                     }
-                    found
                 }
                 else -> return
-            } ?: return
+            }
 
-            // Read real foreground time (only used when unlocked for ADD mode)
             val realForegroundMs = if (!isSessionLocked) {
                 getLongField(targetEntry, "mTotalTimeInForeground")
             } else {
                 0L
             }
 
-            // Ensure locked (computes + caches on first pass, serves from cache after)
             val snapshot = ensureLocked(queryBeginTime, queryEndTime, realForegroundMs) ?: return
 
-            // Handle HIDE mode
             if (snapshot.mode == MODE_HIDE) {
                 var removed = false
                 if (result is MutableList<*>) removed = result.remove(targetEntry)
@@ -822,7 +764,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 return
             }
 
-            // Apply values
             val failed = mutableListOf<String>()
             fun writeLong(field: String, value: Long) {
                 if (!setLongField(targetEntry, field, value)) failed.add(field)
@@ -833,10 +774,9 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
             writeLong("mBeginTimeStamp", snapshot.queryBeginTime)
             writeLong("mEndTimeStamp", snapshot.queryEndTime)
             writeLong("mLastTimeUsed", snapshot.lastUsedTime)
-            writeLong("mLastTimeVisible", snapshot.lastUsedTime)
+            writeLong("mLastTimeVisible", snapshot.lastUsedTime + 500L)
 
-            val nextLaunchCount = getIntField(targetEntry, "mAppLaunchCount") + 1
-            if (!setIntField(targetEntry, "mAppLaunchCount", nextLaunchCount)) {
+            if (!setIntField(targetEntry, "mAppLaunchCount", snapshot.launchCount)) {
                 failed.add("mAppLaunchCount")
             }
 
@@ -861,10 +801,6 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * Timeline mutation, shared by every events entry point.
-     * Serves from cache when locked; builds and caches when unlocked.
-     */
     private fun applyTimeline(result: Any?, queryBeginTime: Long, queryEndTime: Long) {
         try {
             val snapshot = ensureLocked(queryBeginTime, queryEndTime) ?: return
@@ -883,11 +819,9 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                 return
             }
 
-            // Wipe pre-existing events for target package
             val removedCount =
                 container.removeAll { eventPackage(it) == snapshot.targetPackage }
 
-            // Stream cached events (rebuild from params for safety)
             val injected = mutableListOf<Any>()
             for (eventParam in snapshot.events) {
                 buildEvent(
@@ -914,6 +848,28 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
             )
         } catch (t: Throwable) {
             logError("queryEvents hook failure: ${t.message}")
+        }
+    }
+
+    /**
+     * Creates a synthetic UsageStats object for the target package.
+     */
+    private fun createUsageStats(packageName: String): Any? {
+        return try {
+            val usageStatsClass = XposedHelpers.findClass(
+                "android.app.usage.UsageStats", null
+            )
+            val constructor = usageStatsClass.getDeclaredConstructor()
+            constructor.isAccessible = true
+            val instance = constructor.newInstance()
+
+            XposedHelpers.setObjectField(instance, "mPackageName", packageName)
+            zeroOutStats(instance)
+
+            instance
+        } catch (t: Throwable) {
+            logError("createUsageStats failed: ${t.message}")
+            null
         }
     }
 
