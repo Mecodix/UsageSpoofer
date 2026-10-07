@@ -530,13 +530,15 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         // ---- timeline: raw events ------------------------------------------
 
         val eventsHook = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) = try {
-                val begin = param.args.longAt(0)
-                val end = param.args.longAt(1)
-                if (begin == null || end == null) return
-                applyTimeline(param.result, begin, end)
-            } catch (t: Throwable) {
-                logError("queryEvents hook failure: ${t.message}")
+            override fun afterHookedMethod(param: MethodHookParam) {
+                try {
+                    val begin = param.args.longAt(0)
+                    val end = param.args.longAt(1)
+                    if (begin == null || end == null) return
+                    applyTimeline(param.result, begin, end)
+                } catch (t: Throwable) {
+                    logError("queryEvents hook failure: ${t.message}")
+                }
             }
         }
         register(
@@ -549,13 +551,15 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
         // ---- timeline: events for package ----------------------------------
 
         val eventsForPackageHook = object : XC_MethodHook() {
-            override fun afterHookedMethod(param: MethodHookParam) = try {
-                val begin = param.args.longAt(1)
-                val end = param.args.longAt(2)
-                if (begin == null || end == null) return
-                applyTimeline(param.result, begin, end)
-            } catch (t: Throwable) {
-                logError("queryEventsForPackage hook failure: ${t.message}")
+            override fun afterHookedMethod(param: MethodHookParam) {
+                try {
+                    val begin = param.args.longAt(1)
+                    val end = param.args.longAt(2)
+                    if (begin == null || end == null) return
+                    applyTimeline(param.result, begin, end)
+                } catch (t: Throwable) {
+                    logError("queryEventsForPackage hook failure: ${t.message}")
+                }
             }
         }
         register(
@@ -768,7 +772,7 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
             } ?: return
 
             // Find target entry
-            val targetEntry: Any? = when (result) {
+            val targetEntry: Any = when (result) {
                 is List<*> -> {
                     val found = result.firstOrNull { statsPackageName(it) == targetPackage }
                     if (found == null) {
@@ -809,7 +813,10 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
             if (snapshot.mode == MODE_HIDE) {
                 var removed = false
                 if (result is MutableList<*>) removed = result.remove(targetEntry)
-                if (result is MutableMap<*, *>) removed = result.remove(targetPackage)
+                if (result is MutableMap<*, *>) {
+                    result.remove(targetPackage)
+                    removed = true
+                }
                 if (!removed) zeroOutStats(targetEntry)
                 log("[State-Machine] $kind HIDDEN $targetPackage removed=$removed")
                 return
