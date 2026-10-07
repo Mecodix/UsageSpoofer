@@ -704,11 +704,11 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
             val queryBeginTime = args.longAt(beginIndex) ?: return
             val queryEndTime = args.longAt(beginIndex + 1) ?: return
 
-            val targetPackage: String? = if (isSessionLocked) {
-                cachedTargetPackage
+            val targetPackage: String = if (isSessionLocked) {
+                cachedTargetPackage ?: return
             } else {
-                resolveConfig()?.targetPackage
-            } ?: return
+                resolveConfig()?.targetPackage ?: return
+            }
 
             // Find or create target entry
             val targetEntry: Any = when (result) {
@@ -717,12 +717,12 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                     if (found != null) {
                         found
                     } else {
-                        val created = createUsageStats(targetPackage)
-                        if (created != null && result is MutableList<*>) {
+                        val created = createUsageStats(targetPackage) ?: return
+                        if (result is MutableList<*>) {
                             result.add(created)
                             log("[State-Machine] $kind: created new row for $targetPackage")
                         }
-                        created ?: return
+                        created
                     }
                 }
                 is Map<*, *> -> {
@@ -733,12 +733,12 @@ class UsageStatsSpoofer : IXposedHookLoadPackage {
                     if (found != null) {
                         found
                     } else {
-                        val created = createUsageStats(targetPackage)
-                        if (created != null && result is MutableMap<*, *>) {
+                        val created = createUsageStats(targetPackage) ?: return
+                        if (result is MutableMap<*, *>) {
                             result[targetPackage] = created
                             log("[State-Machine] $kind: created new entry for $targetPackage")
                         }
-                        created ?: return
+                        created
                     }
                 }
                 else -> return
